@@ -58,14 +58,46 @@ regions=(
   "us-isob-east-1"
 )
 
+# Possible bucket name permutations
+bucket_variations=(
+  "$BUCKET_NAME"
+  "www.$BUCKET_NAME"
+  "$BUCKET_NAME-www"
+  "$BUCKET_NAME-s3"
+  "$BUCKET_NAME-$region"
+)
+
 # Iterate through each region and check the bucket
 for region in "${regions[@]}"; do
-  sudo aws s3 ls s3://"$BUCKET_NAME"/ --no-sign-request --region "$region" 2>/dev/null
+  for variation in "${bucket_variations[@]}"; do
+    endpoints=(
+      "s3.amazonaws.com/$variation"
+      "$variation.s3.amazonaws.com"
+      "$variation.s3.$region.amazonaws.com"
+      "$variation.s3-website.$region.amazonaws.com"
+      "$variation.s3-website.$region.amazonaws.com"
+    )
 
-  # Check the exit status of the last command
-  if [ $? -eq 0 ]; then
-    echo "Bucket '$BUCKET_NAME' found in region '$region'."
-  else
-    echo "Bucket '$BUCKET_NAME' not found in region '$region'."
-  fi
+    for endpoint in "${endpoints[@]}"; do
+      echo "Checking bucket variation '$variation' at endpoint '$endpoint' in region '$region'..."
+
+      # Try unauthenticated access
+      sudo aws s3 ls s3://"$endpoint"/ --no-sign-request --region "$region" 2>/dev/null
+
+      if [ $? -eq 0 ]; then
+        echo "Bucket '$variation' accessible without credentials at endpoint '$endpoint' in region '$region'."
+      else
+        echo "Bucket '$variation' not accessible without credentials at endpoint '$endpoint' in region '$region'."
+      fi
+
+      # Try authenticated access (if credentials are configured)
+      sudo aws s3 ls s3://"$endpoint"/ --region "$region" 2>/dev/null
+
+      if [ $? -eq 0 ]; then
+        echo "Bucket '$variation' accessible with credentials at endpoint '$endpoint' in region '$region'."
+      else
+        echo "Bucket '$variation' not accessible with credentials at endpoint '$endpoint' in region '$region'."
+      fi
+    done
+  done
 done
