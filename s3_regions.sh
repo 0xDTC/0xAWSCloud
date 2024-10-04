@@ -99,10 +99,11 @@ check_bucket() {
   )
 
   for endpoint in "${endpoints[@]}"; do
-    aws s3 ls s3://"$variation" --no-sign-request --region "$region" 2>/dev/null
+    # Check if bucket is accessible without credentials
+    aws s3 ls s3://"$variation" --no-sign-request --region "$region" >/dev/null 2>&1
 
     if [ $? -eq 0 ]; then
-      echo -e "\nBucket '$variation' is accessible without credentials at endpoint '$endpoint' in region '$region'."
+      echo -e "\nBucket accessible at endpoint '$endpoint' in region '$region'."
       found=1
     fi
   done
