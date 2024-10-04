@@ -58,7 +58,7 @@ regions=(
   "us-isob-east-1"
 )
 
-# Possible bucket name permutations
+# Possible bucket name variations
 bucket_variations=(
   "$BUCKET_NAME"
   "www.$BUCKET_NAME"
@@ -67,37 +67,76 @@ bucket_variations=(
   "$BUCKET_NAME-$region"
 )
 
-# Iterate through each region and check the bucket
+# Flag to track if a bucket was found
+found=0
+
+# Progress bar function
+progress_bar() {
+  local progress=$1
+  local total=$2
+  local width=50  # Width of the progress bar
+  local percent=$((progress * 100 / total))
+  local filled=$((progress * width / total))
+  local empty=$((width - filled))
+
+  # Create the progress bar visual
+  printf "\rProgress: ["
+  printf "%0.s#" $(seq 1 $filled)
+  printf "%0.s " $(seq 1 $empty)
+  printf "] %d%%" "$percent"
+}
+
+# Function to check buckets in parallel threads
+check_bucket() {
+  local region=$1
+  local variation=$2
+
+  endpoints=(
+    "s3.amazonaws.com/$variation"
+    "$variation.s3.amazonaws.com"
+    "$variation.s3.$region.amazonaws.com"
+    "$variation.s3-website.$region.amazonaws.com"
+  )
+
+  for endpoint in "${endpoints[@]}"; do
+    aws s3 ls s3://"$variation" --no-sign-request --region "$region" 2>/dev/null
+
+    if [ $? -eq 0 ]; then
+      echo -e "\nBucket '$variation' is accessible without credentials at endpoint '$endpoint' in region '$region'."
+      found=1
+    fi
+  done
+}
+
+# Limit concurrency to 10 threads
+threads=10
+counter=0
+
+# Calculate total checks for progress tracking
+total_checks=$(( ${#regions[@]} * ${#bucket_variations[@]} ))
+
+# Iterate through each region and variation, launching checks in the background
 for region in "${regions[@]}"; do
   for variation in "${bucket_variations[@]}"; do
-    endpoints=(
-      "s3.amazonaws.com/$variation"
-      "$variation.s3.amazonaws.com"
-      "$variation.s3.$region.amazonaws.com"
-      "$variation.s3-website.$region.amazonaws.com"
-      "$variation.s3-website.$region.amazonaws.com"
-    )
+    ((counter++))
+    check_bucket "$region" "$variation" &  # Run in the background
 
-    for endpoint in "${endpoints[@]}"; do
-      echo "Checking bucket variation '$variation' at endpoint '$endpoint' in region '$region'..."
+    # Display progress bar
+    progress_bar $counter $total_checks
 
-      # Try unauthenticated access
-      sudo aws s3 ls s3://"$endpoint"/ --no-sign-request --region "$region" 2>/dev/null
-
-      if [ $? -eq 0 ]; then
-        echo "Bucket '$variation' accessible without credentials at endpoint '$endpoint' in region '$region'."
-      else
-        echo "Bucket '$variation' not accessible without credentials at endpoint '$endpoint' in region '$region'."
-      fi
-
-      # Try authenticated access (if credentials are configured)
-      sudo aws s3 ls s3://"$endpoint"/ --region "$region" 2>/dev/null
-
-      if [ $? -eq 0 ]; then
-        echo "Bucket '$variation' accessible with credentials at endpoint '$endpoint' in region '$region'."
-      else
-        echo "Bucket '$variation' not accessible with credentials at endpoint '$endpoint' in region '$region'."
-      fi
-    done
+    # Wait if 10 threads are running
+    if [ $((counter % threads)) -eq 0 ]; then
+      wait
+    fi
   done
 done
+
+# Wait for any remaining threads
+wait
+
+# Final message
+if [ $found -eq 0 ]; then
+  echo -e "\nNo publicly accessible buckets found."
+else
+  echo -e "\nPublicly accessible bucket(s) found!"
+fi
