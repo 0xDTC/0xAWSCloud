@@ -2,4 +2,4 @@
 
 # AWS Security Scripts
 
-s3_regions.sh > To check if the unauthenticated s3 bucket is accessable
+[s3_regions.sh](https://github.com/0xDTC/0xAWSCloud/blob/master/s3_regions.sh) > To check if the unauthenticated s3 bucket is accessable
