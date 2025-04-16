@@ -23,16 +23,62 @@ A comprehensive S3 bucket accessibility checker that tests for publicly accessib
 
 ### Example
 ```bash
-./s3_regions.sh -b example
+./s3_regions.sh -b acme-corp
 ```
 
-### Output
-- Shows accessible buckets via HTTP (in red)
-- Shows accessible buckets via HTTPS (in green)
-- Shows accessible buckets via AWS CLI (with region information)
-- Provides a summary of all discoveries
+Example Output:
+```
+==== S3 Bucket Accessibility Check ====
+Base name: acme-corp
 
-### Web output needs as fix
+======== S3 Web (Global) ========
+[HTTP 200] Accessible: http://acme-corp.s3.amazonaws.com
+[HTTPS 200] Accessible: https://acme-corp.s3.amazonaws.com
+
+======== S3 Web (Region-based) ========
+[HTTP 200] Accessible: http://acme-corp.s3.us-east-1.amazonaws.com
+[HTTPS 200] Accessible: https://acme-corp.s3.us-east-1.amazonaws.com
+
+======== AWS CLI ========
+[AWS CLI] Found: s3://acme-corp (us-east-1)
+
+Done. Found one or more accessible buckets above.
+```
+
+### Workflow Diagram
+```mermaid
+graph TD
+    A[Start] --> B[Parse Arguments]
+    B --> C[Initialize Variables]
+    C --> D[Create Temp Directory]
+    D --> E[Phase 1: Web Global Checks]
+    D --> F[Phase 2: Web Region Checks]
+    D --> G[Phase 3: AWS CLI Checks]
+    E --> H[Check HTTP/HTTPS Access]
+    F --> I[Generate Region Endpoints]
+    I --> J[Check Region Access]
+    G --> K[Check AWS CLI Access]
+    H --> L[Mark Found Buckets]
+    J --> L
+    K --> L
+    L --> M[Display Results]
+    M --> N[Cleanup]
+    N --> O[End]
+
+    subgraph "Concurrent Processing"
+    E
+    F
+    G
+    end
+
+    subgraph "Bucket Name Variations"
+    P[Base Name]
+    Q[www. Prefix/Suffix]
+    R[Domain Style]
+    S[Environment Tags]
+    T[Common Suffixes]
+    end
+```
 
 ### Bucket Name Variations
 The script tests multiple variations of the provided bucket name:
