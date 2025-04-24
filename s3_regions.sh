@@ -246,11 +246,11 @@ check_awscli() {
 check_url() {
     local url="$1"
     local output_file="$2"
-    
+
     # Normalize URL format
     url="${url#http://}"
     url="${url#https://}"
-    
+
     # Check if URL has been processed
     if url_checked "$url"; then
         return
@@ -259,21 +259,25 @@ check_url() {
 
     local temp_file=$(mktemp)
     local headers_file=$(mktemp)
-    
+    local found_http=false
+    local found_https=false
+    local http_url=""
+    local https_url=""
+
     # Try both HTTP and HTTPS
     for protocol in "http" "https"; do
         local full_url="${protocol}://${url}"
-        
+
         # Skip s3-website endpoints entirely
         if [[ "$full_url" == *"s3-website"* ]]; then
             continue
         fi
-        
+
         # For S3 URLs, don't follow redirects
         if [[ "$full_url" == *".s3."* ]] || [[ "$full_url" == *"s3.amazonaws.com"* ]]; then
             # Check without following redirects
-            status_code=$(curl -s -D "$headers_file" -o "$temp_file" -w "%{http_code}" --max-time 10 -H "Accept: text/html,application/xhtml+xml" "$full_url" 2>/dev/null)
-            
+            status_code=$(curl -s -D "$headers_file" -o "$temp_file" -w "%{http_code}" -H "Accept: text/html,application/xhtml+xml" "$full_url" 2>/dev/null)
+
             # For S3 URLs, a 403 (Forbidden) means the bucket exists but is private
             if [ "$status_code" -eq 403 ]; then
                 if grep -q -i "AccessDenied" "$temp_file" && ! grep -q -i "InvalidBucketName\|NoSuchBucket" "$temp_file"; then
@@ -287,7 +291,13 @@ check_url() {
                     if grep -q -i "ListBucketResult\|<Contents>" "$temp_file"; then
                         # Verify it's not just an error page masquerading as 200
                         if ! grep -q -i "The specified bucket does not exist\|InvalidBucketName" "$temp_file"; then
-                            echo -e "\033[1;32m[S3 200]\033[0m Accessible: \033[1;32m$full_url\033[0m"
+                            if [ "$protocol" = "https" ]; then
+                                found_https=true
+                                https_url="$full_url"
+                            else
+                                found_http=true
+                                http_url="$full_url"
+                            fi
                             add_found_url "$full_url"
                         fi
                     fi
@@ -295,21 +305,23 @@ check_url() {
             fi
         else
             # For non-S3 URLs, check if they resolve to actual content
-            status_code=$(curl -L -s -D "$headers_file" -o "$temp_file" -w "%{http_code}" --max-time 10 -H "Accept: text/html,application/xhtml+xml" "$full_url" 2>/dev/null)
-            
+            status_code=$(curl -L -s -D "$headers_file" -o "$temp_file" -w "%{http_code}" -H "Accept: text/html,application/xhtml+xml" "$full_url" 2>/dev/null)
+
             if [ "$status_code" -eq 200 ]; then
                 # Make sure it's not an error page or redirect
                 if [ -s "$temp_file" ] && \
                    ! grep -q -i "<Error>\|WebsiteRedirect\|NoSuchBucket\|Request does not contain a bucket name\|301 Moved Permanently\|404 Not Found\|PermanentRedirect\|TemporaryRedirect" "$temp_file"; then
-                    
+
                     # Additional validation for potential S3 content
                     if grep -q -i "ListBucketResult\|<Contents>\|<Key>" "$temp_file"; then
                         # Final check for masked error responses
                         if ! grep -q -i "The specified bucket does not exist\|InvalidBucketName" "$temp_file"; then
                             if [ "$protocol" = "https" ]; then
-                                echo -e "\033[1;32mAccessible: \033[1;32m$full_url\033[0m"
+                                found_https=true
+                                https_url="$full_url"
                             else
-                                echo -e "\033[1;31mAccessible: \033[1;31m$full_url\033[0m"
+                                found_http=true
+                                http_url="$full_url"
                             fi
                             add_found_url "$full_url"
                         fi
@@ -318,7 +330,15 @@ check_url() {
             fi
         fi
     done
-    
+
+    # Print results in order
+    if [ "$found_http" = true ]; then
+        echo -e "\033[1;31m[WEB]\033[0m Accessible: \033[1;31m$http_url\033[0m"
+    fi
+    if [ "$found_https" = true ]; then
+        echo -e "\033[1;32m[WEB]\033[0m Accessible: \033[1;32m$https_url\033[0m"
+    fi
+
     rm -f "$temp_file" "$headers_file"
 }
 
