@@ -1,5 +1,29 @@
 #!/bin/bash
 
+# Global variables
+CLEANUP_IN_PROGRESS=0
+tmpdir=""
+
+# Cleanup function
+cleanup() {
+    # Set cleanup flag
+    CLEANUP_IN_PROGRESS=1
+    
+    # Kill all child processes
+    pkill -P $$ 2>/dev/null || true
+    
+    # Clean up temp directory if it exists
+    if [ -n "$tmpdir" ] && [ -d "$tmpdir" ]; then
+        rm -rf "$tmpdir" 2>/dev/null || true
+    fi
+    
+    # Exit immediately
+    exit 0
+}
+
+# Set up trap
+trap 'cleanup' EXIT INT TERM
+
 ########################################
 # Display usage
 ########################################
@@ -148,8 +172,15 @@ threads=5
 # We'll track findings in a temp dir, so concurrency doesn't break them
 tmpdir=$(mktemp -d)
 
+# Add at the beginning of the script, after the shebang
+trap 'cleanup' EXIT INT TERM
+
+# Add a global variable to track cleanup state
+CLEANUP_IN_PROGRESS=0
+
 # Instead of a global variable for found_any, we'll store markers in a file
 mark_found() {
+  [ "$CLEANUP_IN_PROGRESS" = "1" ] && exit 0
   echo 1 >> "$tmpdir/found_any_markers"
 }
 
@@ -281,7 +312,7 @@ check_url() {
             # For S3 URLs, a 403 (Forbidden) means the bucket exists but is private
             if [ "$status_code" -eq 403 ]; then
                 if grep -q -i "AccessDenied" "$temp_file" && ! grep -q -i "InvalidBucketName\|NoSuchBucket" "$temp_file"; then
-                    echo -e "\033[1;33m[S3 403]\033[0m Found (Access Denied): \033[1;33m$full_url\033[0m"
+                    echo -e "\033[1;33m[WEB]\033[0m Found (Access Denied): \033[1;33m$full_url\033[0m"
                     add_found_url "$full_url (Access Denied)"
                 fi
             # For 200 responses, verify it's actually a valid S3 response
@@ -344,17 +375,20 @@ check_url() {
 
 # Helper function to track checked URLs
 url_checked() {
+    [ "$CLEANUP_IN_PROGRESS" = "1" ] && exit 0
     local url="$1"
     [ -f "$tmpdir/checked_urls" ] && grep -q "^$url$" "$tmpdir/checked_urls" 2>/dev/null
 }
 
 mark_url_checked() {
+    [ "$CLEANUP_IN_PROGRESS" = "1" ] && exit 0
     local url="$1"
     echo "$url" >> "$tmpdir/checked_urls"
 }
 
 # Helper function to add found URLs
 add_found_url() {
+    [ "$CLEANUP_IN_PROGRESS" = "1" ] && exit 0
     local url="$1"
     if ! grep -q "^$url$" "$tmpdir/found_urls" 2>/dev/null; then
         echo "$url" >> "$tmpdir/found_urls"
@@ -426,17 +460,6 @@ aws_cli_checks() {
 ########################################
 # MAIN
 ########################################
-# Set up cleanup on script termination
-trap 'cleanup' EXIT INT TERM
-
-cleanup() {
-    echo -e "\n\033[1;33mCleaning up...\033[0m"
-    if [ -d "$tmpdir" ]; then
-        rm -rf "$tmpdir"
-    fi
-    exit 0
-}
-
 echo -e "\033[1;36m==== S3 Bucket Accessibility Check ====\033[0m"
 echo -e "Base name: \033[1;33m$BASE_NAME\033[0m"
 
