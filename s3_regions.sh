@@ -268,16 +268,37 @@ check_awscli() {
     # Mark as seen first to prevent duplicates
     seen_cli[$noregion_key]="1"
     
-    if aws s3 ls "s3://$bucket" --no-sign-request &>/dev/null; then
+    # Create a temporary file to capture output
+    local output_file=$(mktemp)
+    
+    # Run the command with a timeout and capture output
+    local result=1
+    if timeout 5s aws s3 ls "s3://$bucket" --no-sign-request > "$output_file" 2>&1; then
+      result=0
+    fi
+    
+    # Check if cleanup is in progress before continuing
+    [ "$CLEANUP_IN_PROGRESS" = "1" ] && { rm -f "$output_file" 2>/dev/null; return; }
+    
+    # If command was successful or output does not contain NoSuchBucket, it's likely accessible
+    if [ $result -eq 0 ] || ! grep -q "NoSuchBucket" "$output_file" 2>/dev/null; then
       mark_found
       echo -e "\033[1;33m[AWS CLI]\033[0m Found: \033[1;32ms3://$bucket\033[0m \033[0;36m(no region)\033[0m"
     fi
+    
+    # Clean up
+    rm -f "$output_file" 2>/dev/null
   fi
 
   # Check each region with deduplication
   for region in "${check_regions[@]}"; do
     # Exit if cleanup started
     [ "$CLEANUP_IN_PROGRESS" = "1" ] && break
+    
+    # Skip any gov, iso, or cn regions which often cause issues
+    if [[ "$region" == *"gov"* ]] || [[ "$region" == *"iso"* ]] || [[ "$region" == *"cn-"* ]]; then
+      continue
+    fi
     
     # Create a unique key for this bucket+region combination
     local region_key="${bucket}_${region}"
@@ -290,10 +311,26 @@ check_awscli() {
     # Mark it as seen first to prevent duplicates
     seen_cli[$region_key]="1"
     
-    if aws s3 ls "s3://$bucket" --no-sign-request --region "$region" &>/dev/null; then
+    # Create a temporary file to capture output
+    local output_file=$(mktemp)
+    
+    # Run the command with a timeout and capture output
+    local result=1
+    if timeout 5s aws s3 ls "s3://$bucket" --no-sign-request --region "$region" > "$output_file" 2>&1; then
+      result=0
+    fi
+    
+    # Check if cleanup is in progress before continuing
+    [ "$CLEANUP_IN_PROGRESS" = "1" ] && { rm -f "$output_file" 2>/dev/null; break; }
+    
+    # If command was successful or output does not contain NoSuchBucket, it's likely accessible
+    if [ $result -eq 0 ] || ! grep -q "NoSuchBucket" "$output_file" 2>/dev/null; then
       mark_found
       echo -e "\033[1;33m[AWS CLI]\033[0m Found: \033[1;32ms3://$bucket\033[0m \033[0;36m($region)\033[0m"
     fi
+    
+    # Clean up
+    rm -f "$output_file" 2>/dev/null
   done
 }
 
@@ -589,20 +626,21 @@ fi
 
 echo -e "[|] Working..."
 
-(
-    # Only run web checks if the flag is set
-    if [ "$RUN_WEB_CHECKS" -eq 1 ]; then
+# Run CLI checks first (serially) if enabled
+if [ "$RUN_CLI_CHECKS" -eq 1 ]; then
+    aws_cli_checks
+fi
+
+# Run web checks in background with spinner if enabled
+if [ "$RUN_WEB_CHECKS" -eq 1 ]; then
+    (
         web_checks_global
         web_checks_region_based
-    fi
-    # Only run CLI checks if the flag is set
-    if [ "$RUN_CLI_CHECKS" -eq 1 ]; then
-        aws_cli_checks
-    fi
-) &
-bg_pid=$!
-spinner "$bg_pid"
-wait "$bg_pid"
+    ) &
+    bg_pid=$!
+    spinner "$bg_pid"
+    wait "$bg_pid"
+fi
 
 echo
 if [ -s "$tmpdir/found_any_markers" ]; then
