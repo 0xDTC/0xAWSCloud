@@ -358,7 +358,7 @@ check_url() {
         # For S3 URLs, don't follow redirects
         if [[ "$full_url" == *".s3."* ]] || [[ "$full_url" == *"s3.amazonaws.com"* ]]; then
             # Check without following redirects
-            status_code=$(curl $secure -m 10 -s -D "$headers_file" -o "$temp_file" -w "%{http_code}" -H "Accept: text/html,application/xhtml+xml" "$full_url" 2>/dev/null || echo 0)
+            status_code=$(curl $secure -s -D "$headers_file" -o "$temp_file" -w "%{http_code}" -H "Accept: text/html,application/xhtml+xml" "$full_url" 2>/dev/null || echo 0)
 
             # Check for interrupted execution
             if [ "$CLEANUP_IN_PROGRESS" = "1" ] || [ ! -f "$temp_file" ] || [ ! -f "$headers_file" ]; then
@@ -378,7 +378,8 @@ check_url() {
             elif [[ "$status_code" =~ ^[0-9]+$ ]] && [ "$status_code" -eq 200 ]; then
                 # Check for actual S3 bucket content
                 if ! grep -q -i "<Error>\|NoSuchBucket\|WebsiteRedirect\|Request does not contain a bucket name\|PermanentRedirect\|TemporaryRedirect" "$temp_file" 2>/dev/null; then
-                    if grep -q -i "ListBucketResult\|<Contents>" "$temp_file" 2>/dev/null; then
+                    # Look for standard S3 bucket content markers OR the specific XML namespace
+                    if grep -q -i "ListBucketResult\|<Contents>\|ListBucketResult xmlns=" "$temp_file" 2>/dev/null; then
                         # Verify it's not just an error page masquerading as 200
                         if ! grep -q -i "The specified bucket does not exist\|InvalidBucketName" "$temp_file" 2>/dev/null; then
                             if [ "$protocol" = "https" ]; then
@@ -398,7 +399,7 @@ check_url() {
             fi
         else
             # For non-S3 URLs, check if they resolve to actual content
-            status_code=$(curl $secure -m 10 -L -s -D "$headers_file" -o "$temp_file" -w "%{http_code}" -H "Accept: text/html,application/xhtml+xml" "$full_url" 2>/dev/null || echo 0)
+            status_code=$(curl $secure -L -s -D "$headers_file" -o "$temp_file" -w "%{http_code}" -H "Accept: text/html,application/xhtml+xml" "$full_url" 2>/dev/null || echo 0)
             
             # Check for interrupted execution
             if [ "$CLEANUP_IN_PROGRESS" = "1" ] || [ ! -f "$temp_file" ] || [ ! -f "$headers_file" ]; then
@@ -412,7 +413,7 @@ check_url() {
                    ! grep -q -i "<Error>\|WebsiteRedirect\|NoSuchBucket\|Request does not contain a bucket name\|301 Moved Permanently\|404 Not Found\|PermanentRedirect\|TemporaryRedirect" "$temp_file" 2>/dev/null; then
 
                     # Additional validation for potential S3 content
-                    if grep -q -i "ListBucketResult\|<Contents>\|<Key>" "$temp_file" 2>/dev/null; then
+                    if grep -q -i "ListBucketResult\|<Contents>\|<Key>\|ListBucketResult xmlns=" "$temp_file" 2>/dev/null; then
                         # Final check for masked error responses
                         if ! grep -q -i "The specified bucket does not exist\|InvalidBucketName" "$temp_file" 2>/dev/null; then
                             if [ "$protocol" = "https" ]; then
