@@ -323,7 +323,7 @@ def _web_check(url: str) -> None:
     if status == 403 and 'AccessDenied' in body and not any(x in body for x in ('NoSuchBucket','InvalidBucketName')):
         found = True
         label = "Found (Access Denied)"
-    elif status == 200 and '<ListBucketResult' in body and not any(e in body for e in ("NoSuchBucket","InvalidBucketName")):
+    elif status == 200 and '<ListBucketResult xmlns=' in body and not any(e in body for e in ("NoSuchBucket","InvalidBucketName")):
         found = True
         label = "Accessible"
     if found:
