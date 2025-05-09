@@ -48,14 +48,14 @@ TDIR           = Path(tempfile.mkdtemp(prefix="s3chk_"))
 FOUND_FLAG     = TDIR / "found"
 CHECKED_TXT    = TDIR / "checked_urls"
 CHECKED_SET: set[str] = set()
-
+PRINTED_URLS: set[str] = set()
 STOP_ALL       = threading.Event()          # master “please stop” flag
 SPIN_STOP      = threading.Event()          # spinner stop flag
 LOCK           = threading.Lock()           # console lock
 EXECUTORS: list[cf.ThreadPoolExecutor] = [] # keep refs for Ctrl-C cleanup
 BASE_FOUND     = threading.Event()          # flag for when the exact base bucket is found
-
 FOUND_BUCKETS  = {}                         # mapping of bucket names to their found regions
+CLI_MODE_DONE  = threading.Event()          # flag to indicate CLI checks are complete
 
 # ────────────────────────── graceful shutdown
 def _cleanup(_sig: int | None = None, _frame: FrameType | None = None) -> None:  # noqa: D401
@@ -116,8 +116,9 @@ def _mark_found(bucket: str = None, region: str = None) -> None:
             if region:
                 FOUND_BUCKETS[bucket].add(region)
     
-    # If the exact base bucket is found, set the flag to stop other checks
-    if bucket and bucket == BASE:
+    # Only set the BASE_FOUND flag to stop current check type
+    # But allow web checks to still run after CLI checks
+    if bucket and bucket == BASE and not BASE_FOUND.is_set():
         BASE_FOUND.set()
 
 
@@ -138,28 +139,85 @@ REGIONS = [
 
 
 def _variations(b: str) -> list[str]:
-    env = ("dev", "staging", "test", "qa", "prod")
-    suf = (
-        "logs", "backups", "archive", "resources", "files", "images",
-        "static", "uploads", "cdn", "content", "assets", "config", "data", "api",
-    )
+    """Generate comprehensive bucket name variations for testing.
+    Based on the shell script's variations list.
+    """
     v: list[str] = [
-        b, f"www.{b}", f"{b}-www",
-        f"{b}.com", f"www.{b}.com", f"{b}-com", f"www-{b}-com",
+        b,
+        f"www.{b}",
+        f"{b}-www",
+        f"{b}.com",
+        f"www.{b}.com",
+        f"{b}-com",
+        f"www-{b}-com",
+        f"{b}-dev",
+        f"{b}-staging",
+        f"{b}-test",
+        f"{b}-qa",
+        f"{b}-prod",
+        f"dev-{b}",
+        f"staging-{b}",
+        f"test-{b}",
+        f"qa-{b}",
+        f"prod-{b}",
+        f"{b}-logs",
+        f"{b}-backups",
+        f"{b}-archive",
+        f"{b}-resources",
+        f"{b}-files",
+        f"{b}-images",
+        f"{b}-static",
+        f"{b}-uploads",
+        f"{b}-cdn",
+        f"{b}-content",
+        f"{b}-assets",
+        f"{b}-config",
+        f"{b}-data",
+        f"{b}-api",
+        f"cdn-{b}",
+        f"files-{b}",
+        f"uploads-{b}",
+        f"static-{b}",
+        f"assets-{b}",
+        f"logs-{b}",
+        f"backups-{b}",
+        f"archive-{b}",
+        f"resources-{b}",
+        f"s1-{b}",
+        f"s2-{b}",
+        f"s3-{b}",
+        f"{b}-s1",
+        f"{b}-s2",
+        f"{b}-s3",
+        f"s3-{b}",
+        b.replace('_', '-'),
+        b.replace('-', '_'),
+        f"{b}-app",
+        f"app-{b}",
+        f"{b}-service",
+        f"service-{b}",
+        f"{b}-storage",
+        f"{b}-dist",
+        f"{b}-v1",
+        f"{b}-v2",
+        f"{b}-old",
+        f"{b}-new",
+        f"v1-{b}",
+        f"v2-{b}",
+        f"{b}.com-dev",
+        f"{b}.com-test",
+        f"{b}.com-prod",
+        f"dev-{b}.com",
+        f"test-{b}.com",
+        f"prod-{b}.com",
+        b.replace('.', '-'),
+        f"www-{b.replace('.', '-')}",
+        f"{b.replace('.', '-')}-dev",
+        f"{b.replace('.', '-')}-prod",
+        f"{b.replace('.', '-')}-logs",
+        f"{b.replace('.', '-')}-assets"
     ]
-    v += [f"{b}-{e}" for e in env] + [f"{e}-{b}" for e in env]
-    v += [f"{b}-{s}" for s in suf] + [f"{s}-{b}" for s in suf]
-    v += [
-        f"{b}-s3", f"s3-{b}", b.replace("_", "-"), b.replace("-", "_"),
-        f"{b}-app", f"app-{b}", f"{b}-service", f"service-{b}",
-        f"{b}-storage", f"{b}-dist",
-        f"{b}-v1", f"{b}-v2", f"{b}-old", f"{b}-new",
-        f"v1-{b}",  f"v2-{b}",
-        f"{b}.com-dev",  f"{b}.com-test",  f"{b}.com-prod",
-        f"dev-{b}.com",  f"test-{b}.com",  f"prod-{b}.com",
-    ]
-    dash = b.replace(".", "-")
-    v += [dash, f"www-{dash}", f"{dash}-dev", f"{dash}-prod", f"{dash}-logs", f"{dash}-assets"]
+    # Remove duplicates while preserving order
     return list(dict.fromkeys(v))
 
 
@@ -235,148 +293,222 @@ def _run_cli() -> None:
     """Only probe the exact BASE bucket across every region.
     No name variations are checked in CLI mode.
     """
+    # Reset CLI_MODE_DONE flag
+    CLI_MODE_DONE.clear()
+    
+    # Run CLI checks
     _cli_probe(BASE)
+    
+    # Set flag to indicate CLI checks are done
+    CLI_MODE_DONE.set()
 
 
 # ────────────────────────── web probe
-def _fetch(url: str) -> str:
-    """Fetch URL content, return the response body as string."""
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla"})
+def _fetch(url: str) -> tuple[int, str, dict]:
     try:
+        # Add proper headers to mimic a browser request
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "text/html,application/xhtml+xml"}
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=5) as resp:
-            return resp.read(4096).decode(errors="ignore")
+            return resp.status, resp.read().decode(errors="ignore"), dict(resp.getheaders())
     except urllib.error.HTTPError as e:
         try:
-            return e.read().decode(errors="ignore")
-        except Exception as ex:
-            return f"Error: {ex}"
-    except Exception as ex:
-        return f"Error: {ex}"
+            body = e.read().decode(errors="ignore")
+        except:
+            body = ""
+        return e.code, body, dict(e.headers or {})
+    except Exception as e:
+        return 0, str(e), {}
 
+def _endpoints(bucket: str, region: str) -> Generator[str, None, None]:
+    # Try the bucket name directly
+    yield f"http://{bucket}"
+    yield f"https://{bucket}"
+    
+    for proto in ("http", "https"):
+        if not region:
+            # Standard global endpoints
+            yield f"{proto}://{bucket}.s3.amazonaws.com"
+            yield f"{proto}://s3.amazonaws.com/{bucket}"
+        else:
+            # Standard regional endpoints
+            yield f"{proto}://{bucket}.s3.{region}.amazonaws.com"
+            yield f"{proto}://s3.{region}.amazonaws.com/{bucket}"
 
-def _endpoints(b: str, r: str) -> Generator[str, None, None]:
-    yield from (
-        b,
-        f"{b}.s3.amazonaws.com",
-        f"s3.amazonaws.com/{b}",
-        f"{b}.s3.{r}.amazonaws.com",
-        f"{b}.s3-website.{r}.amazonaws.com",
-        f"{b}.s3-website-{r}.amazonaws.com",
-        f"{b}.s3-{r}.amazonaws.com",
-        f"s3.{r}.amazonaws.com/{b}",
-        f"s3-website.{r}.amazonaws.com/{b}",
-        f"s3-website-{r}.amazonaws.com/{b}",
-        f"s3-{r}.amazonaws.com/{b}",
-        f"{b}.s3.dualstack.{r}.amazonaws.com",
-        f"s3.dualstack.{r}.amazonaws.com/{b}",
-    )
-
+            # Hyphenated regional endpoints
+            yield f"{proto}://{bucket}.s3-{region}.amazonaws.com"
+            yield f"{proto}://s3-{region}.amazonaws.com/{bucket}"
+            yield f"{proto}://{bucket}.s3-website.{region}.amazonaws.com"
+            yield f"{proto}://s3-website.{region}.amazonaws.com/{bucket}"
+            yield f"{proto}://s3-website-{region}.amazonaws.com/{bucket}"
+            yield f"{proto}://{bucket}.s3-website-{region}.amazonaws.com"
+            
+            # Dualstack endpoints
+            yield f"{proto}://{bucket}.s3.dualstack.{region}.amazonaws.com"
+            yield f"{proto}://s3.dualstack.{region}.amazonaws.com/{bucket}"
 
 def _web_check(url: str) -> None:
-    """Check a single URL for accessibility, log results."""
-    if url in CHECKED_SET or STOP_ALL.is_set() or BASE_FOUND.is_set():
+    # Skip if already checked or if we should stop
+    with LOCK:
+        if url in CHECKED_SET or STOP_ALL.is_set():
+            return
+        CHECKED_SET.add(url)
+
+    # Skip website endpoints
+    if 's3-website' in url:
         return
-    CHECKED_SET.add(url)
-    try:
-        # Extract bucket name and region from URL
-        parts = url.split('//')
-        if len(parts) > 1:
-            hostname = parts[1].split('/')[0]
-            bucket_name = hostname.split('.')[0]
-            region = None
-            if 's3' in hostname and 'amazonaws.com' in hostname:
-                region_part = hostname.split('.')
-                if len(region_part) > 2 and region_part[1] != 's3':
-                    region = region_part[1]
+
+    # The bucket name is always our base bucket when we're checking pre-defined URLs
+    bucket_name = BASE
+    
+    # Extract region if present in URL for better logging
+    region = None
+    if '.s3.' in url:
+        if '.s3.amazonaws.com' in url:
+            region = None  # Global endpoint
+        elif '.dualstack.' in url:
+            # Extract region from dualstack URL
+            match = re.search(r'\.s3\.dualstack\.([\w-]+)\.amazonaws\.com', url)
+            if match:
+                region = match.group(1)
         else:
-            return
-            
-        # Skip if we've already found this bucket with this region
-        region_label = "No Region" if region is None else region
-        if bucket_name in FOUND_BUCKETS and (region is None or region_label in FOUND_BUCKETS[bucket_name]):
-            return
-            
-        resp = _fetch(url)
-        if re.search(r"<Key>|<Contents>", resp):
-            _mark_found(bucket_name, region_label)
-            _log(f"\033[1;33m[Web]\033[0m \033[1;32mListable\033[0m: \033[1;36m{url}\033[0m", show_always=True)
-        elif re.search(r"(ListBucketResult|CommonPrefixes)", resp):
-            _mark_found(bucket_name, region_label)
-            _log(f"\033[1;33m[Web]\033[0m \033[1;32mEmpty but listable\033[0m: \033[1;36m{url}\033[0m", show_always=True)
-        elif VERBOSE and re.search(r"(AccessDenied|NoSuchBucket|InvalidBucketName)", resp):
-            code = _error_code(resp)
-            _log(f"\033[1;31m[Web]\033[0m Not accessible: \033[1;36m{url}\033[0m ({code})")
-        elif VERBOSE:
-            _log(f"\033[1;31m[Web]\033[0m Not listable: \033[1;36m{url}\033[0m")
-    except urllib.error.URLError as ex:
+            # Extract region from standard URL
+            match = re.search(r'\.s3\.([\w-]+)\.amazonaws\.com', url)
+            if match:
+                region = match.group(1)
+    elif '.s3-' in url:
+        # Extract region from hyphenated URL
+        match = re.search(r'\.s3-([\w-]+)\.amazonaws\.com', url)
+        if match:
+            region = match.group(1)
+    
+    region_label = region or 'No Region'
+    
+    # Skip if we've already found this bucket in this region
+    if bucket_name in FOUND_BUCKETS and region_label in FOUND_BUCKETS[bucket_name]:
+        return
+
+    try:
+        status, body, _ = _fetch(url)
+    except Exception as e:
         if VERBOSE:
-            _log(f"\033[1;31m[Web]\033[0m Error: \033[1;36m{url}\033[0m ({ex.reason})")
-    except Exception as ex:
-        if VERBOSE:
-            _log(f"\033[1;31m[Web]\033[0m Exception: \033[1;36m{url}\033[0m ({ex})")
+            _log(f"\033[1;31m[Web]\033[0m Error: {url} ({e})")
+        return
+
+    found = False
+    msg = ''
+    if status == 403 and 'AccessDenied' in body and not any(x in body for x in ('NoSuchBucket','InvalidBucketName')):
+        msg = f"\033[1;33m[Web]\033[0m Found (Access Denied): \033[1;33m{url}\033[0m"
+        found = True
+    elif status == 200:
+        # Check for error indicators in 200 responses (as they might be error pages)
+        error_indicators = ["<Error>", "WebsiteRedirect", "NoSuchBucket", 
+                           "Request does not contain a bucket name", "301 Moved Permanently", 
+                           "404 Not Found", "PermanentRedirect", "TemporaryRedirect"]
+        
+        if not any(indicator in body for indicator in error_indicators):
+            # Check for S3 bucket listing indicators
+            if "<ListBucketResult xmlns=" in body:
+                # Final check to exclude masked errors
+                if not any(x in body for x in ["The specified bucket does not exist", "InvalidBucketName"]):
+                    msg = f"Accessible: {url}"
+                    found = True
+
+    if found:
+        _mark_found(bucket_name, region_label)
+        
+        # Color HTTP URLs red and HTTPS URLs green for accessible buckets
+        if "https://" in url:
+            url_color = "\033[1;32m"  # Green for HTTPS (secure)
+        else:
+            url_color = "\033[1;31m"  # Red for HTTP (not secure)
+        
+        # Format message based on access type
+        if status == 403:  # Access Denied
+            formatted_msg = f"\033[1;33m[Web]\033[0m Found (Access Denied): {url_color}{url}\033[0m"
+        else:  # Accessible
+            formatted_msg = f"\033[1;32m[Web]\033[0m Accessible: {url_color}{url}\033[0m"
+        
+        # Use PRINTED_URLS to track which URLs we've already printed to avoid duplicates
+        with LOCK:
+            if url not in PRINTED_URLS:
+                PRINTED_URLS.add(url)
+                print(formatted_msg)
+    elif VERBOSE:
+        _log(f"\033[1;31m[Web]\033[0m Not listable: {url}")
 
 
 def _run_web() -> None:
-    """Check all variations and permutations of the base bucket name via web.
-    This is where we try different name variations.
-    """
-    with cf.ThreadPoolExecutor(max_workers=THREADS) as exec:
-        EXECUTORS.append(exec)
+    print(f"Checking web endpoints for '{BASE}'...")
+    buckets = [BASE] + [v for v in VARIATIONS if v != BASE]
+    
+    # Calculate total beforehand by actually counting all the URLs
+    all_urls = []
+    for b in buckets:
+        for url in _endpoints(b, ''):
+            all_urls.append(url)
+        for r in REGIONS:
+            for url in _endpoints(b, r):
+                all_urls.append(url)
+    
+    total = len(all_urls)
+    done = 0
+    
+    # Use progress counter during execution
+    with cf.ThreadPoolExecutor(max_workers=THREADS) as ex:
+        EXECUTORS.append(ex)
         futures = []
-        for bucket in VARIATIONS:
-            for r in REGIONS + [None]:
-                region = r or ""
-                for url in _endpoints(bucket, region):
-                    futures.append(exec.submit(_web_check, url))
-
-        total = len(futures)
-        # wait for all http requests to complete
-        for i, _ in enumerate(cf.as_completed(futures)):
+        
+        # Submit all URLs for checking
+        for url in all_urls:
+            futures.append(ex.submit(_web_check, url))
+        
+        # Process results and update counter
+        for _ in cf.as_completed(futures):
+            done += 1
+            if done % 10 == 0 or done == total:
+                _progress_counter(done, total)
             if STOP_ALL.is_set():
                 break
-            if i % 5 == 0 or i+1 == total:  # Update counter more frequently
-                _progress_counter(i+1, total)
+    
+    sys.stdout.write("\r" + " " * 80 + "\r")
+    sys.stdout.flush()
 
 
-# ────────────────────────── MAIN
+# ──────────────────── MAIN
 def main() -> None:
-    """Show welcome message, start spinner, run tests, show results."""
+    # Import regex module at runtime
+    global re
+    import re
+
     if RUN_CLI and not shutil.which("aws"):
-        print("\033[1;31mError: AWS CLI not found. Install it or use --web-only flag.\033[0m")
+        print("\033[1;31mError: AWS CLI not found. Install or use --web-only.\033[0m")
         sys.exit(1)
 
-    mode = "Web-only" if RUN_WEB and not RUN_CLI else "CLI-only" if RUN_CLI and not RUN_WEB else "Both Web and CLI checks"
     print("==== S3 Bucket Accessibility Check ====")
     print(f"Base name: {BASE}")
+    mode = "Web-only" if RUN_WEB and not RUN_CLI else "CLI-only" if RUN_CLI and not RUN_WEB else "Both Web and CLI checks"
     print(f"Mode: {mode}")
     if VERBOSE:
-        print("Verbose mode: ON (showing all attempts)")
-
-    # No spinner thread needed with progress counter
+        print("Verbose mode: ON")
 
     try:
-        # CLI check - only checks the exact base bucket in different regions
         if RUN_CLI:
             _run_cli()
-        
-        # Web checks - checks name variations and permutations
+            sys.stdout.write("\r" + " " * 50 + "\r")
         if RUN_WEB:
             _run_web()
     except KeyboardInterrupt:
         print("\n\033[1;33mSearch interrupted by user.\033[0m")
     finally:
-        # Clear the progress counter line
         sys.stdout.write("\r" + " " * 50 + "\r")
         sys.stdout.flush()
-        
-        # Print summary of found buckets
         if BASE in FOUND_BUCKETS:
             print(f"\n\033[1;32mBase bucket '{BASE}' is accessible!\033[0m")
         else:
             print(f"\n\033[1;33mFound {len(FOUND_BUCKETS)} accessible bucket(s), but not the base bucket '{BASE}'.\033[0m")
-        
         if not FOUND_BUCKETS:
             print("\033[1;31mNo accessible buckets found.\033[0m")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
