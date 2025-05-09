@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import shutil
 import os
 import re
 import signal
@@ -203,6 +204,7 @@ VARIATIONS = _variations(BASE)
 # ────────────────────────── AWS-CLI probe
 TOTAL_RE = re.compile(r"Total\s+Objects:\s+(\d+)")
 ERR_IN_PAREN = re.compile(r"\(([^)]+)\)")
+
 
 def _error_code(text: str) -> str:
     if (m := ERR_IN_PAREN.search(text)):
