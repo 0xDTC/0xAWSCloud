@@ -22,10 +22,12 @@ A comprehensive S3 bucket accessibility checker that tests for publicly accessib
 - Threaded concurrent processing for faster results
 - Progress counter for visibility
 - Real-time feedback on accessible buckets
+- Automatic TLS/SSL certificate validation bypass for HTTPS endpoints
+- Configurable concurrency via thread control
 
 ### Usage
 ```bash
-python3 s3_regions.py -b bucket_name [-c] [-w] [-v]
+python3 s3_regions.py -b bucket_name [-c] [-w] [-v] [-t THREADS]
 ```
 
 Options:
@@ -33,6 +35,7 @@ Options:
 - `-c, --cli-only`: Only perform AWS CLI checks
 - `-w, --web-only`: Only perform web checks
 - `-v, --verbose`: Show verbose output (all attempts)
+- `-t, --threads`: Number of concurrent threads for web checks (default: 30)
 
 By default, both CLI and web checks are performed.
 

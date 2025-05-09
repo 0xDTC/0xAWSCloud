@@ -10,7 +10,6 @@ Usage
 """
 
 from __future__ import annotations
-
 import argparse
 import concurrent.futures as cf
 import shutil
@@ -26,6 +25,7 @@ import urllib.request
 from pathlib import Path
 from typing import Generator
 from types import FrameType
+import ssl
 
 # ────────────────────────── CLI flags
 PAR = argparse.ArgumentParser(description="S3 bucket accessibility checker")
@@ -34,13 +34,20 @@ MEX = PAR.add_mutually_exclusive_group()
 MEX.add_argument("-w", "--web-only", action="store_true", help="Web checks only")
 MEX.add_argument("-c", "--cli-only", action="store_true", help="CLI checks only")
 PAR.add_argument("-v", "--verbose", action="store_true", help="Show all access attempts (verbose mode)")
+PAR.add_argument("-t", "--threads", type=int, default=30, help="Concurrent threads for web checks (default: 30)")
 ARGS = PAR.parse_args()
 
 BASE: str = ARGS.bucket.strip()
 RUN_WEB: bool = not ARGS.cli_only
 RUN_CLI: bool = not ARGS.web_only
 VERBOSE: bool = ARGS.verbose
-THREADS: int = 5
+THREADS: int = ARGS.threads
+
+# Remove user-facing insecure flag; always skip certificate verification for HTTPS.
+# Create SSL context once.
+SSL_CONTEXT = ssl.create_default_context()
+SSL_CONTEXT.check_hostname = False
+SSL_CONTEXT.verify_mode = ssl.CERT_NONE
 
 # ────────────────────────── tmp-files / shared flags
 TDIR           = Path(tempfile.mkdtemp(prefix="s3chk_"))
@@ -53,7 +60,7 @@ SPIN_STOP      = threading.Event()          # spinner stop flag
 LOCK           = threading.Lock()           # console lock
 EXECUTORS: list[cf.ThreadPoolExecutor] = [] # keep refs for Ctrl-C cleanup
 BASE_FOUND     = threading.Event()          # flag for when the exact base bucket is found
-FOUND_BUCKETS  = {}                         # mapping of bucket names to their found regions
+FOUND_BUCKETS: dict[str, set[str]] = {}        # mapping of bucket names to their found regions
 CLI_MODE_DONE  = threading.Event()          # flag to indicate CLI checks are complete
 
 # ────────────────────────── graceful shutdown
@@ -94,7 +101,7 @@ def _progress_counter(current: int, total: int) -> None:
         sys.stdout.flush()
 
 
-def _mark_found(bucket: str = None, region: str = None) -> None:
+def _mark_found(bucket: str | None = None, region: str | None = None) -> None:
     FOUND_FLAG.touch()
     if bucket:
         with LOCK:
@@ -281,18 +288,22 @@ def _run_cli() -> None:
 
 
 # ────────────────────────── web probe
-def _fetch(url: str) -> tuple[int,str,dict]:
+def _fetch(url: str) -> tuple[int, str, dict[str, str]]:
+    ctx = SSL_CONTEXT if url.startswith("https://") else None
     try:
-        with urllib.request.urlopen(urllib.request.Request(url)) as resp:
+        with urllib.request.urlopen(urllib.request.Request(url), context=ctx) as resp:
             return resp.status, resp.read().decode(errors="ignore"), dict(resp.getheaders())
     except urllib.error.HTTPError as e:
-        try: body = e.read().decode(errors="ignore")
-        except: body = ""
-        return e.code, body, dict(e.headers or {})
+        try: 
+            body = e.read().decode(errors="ignore")
+        except Exception as _:
+            body = ""
+        return e.code, body, dict(e.headers or {}) if e.headers else {}
     except Exception as e:
-        return 0, str(e), {}
+        return 0, str(e), {}  # Empty dict[str, str]
 
-def _endpoints(bucket: str, region: str) -> Generator[str, None, None]:
+
+def _endpoints(bucket: str, region: str | None) -> Generator[str, None, None]:
     for proto in ("http", "https"):
         yield f"{proto}://{bucket}"
         if not region:
@@ -322,6 +333,7 @@ def _web_check(url: str) -> None:
         CHECKED_SET.add(url)
     status, body, _ = _fetch(url)
     found = False
+    label = ""
     if status == 403 and 'AccessDenied' in body and not any(x in body for x in ('NoSuchBucket','InvalidBucketName')):
         found = True
         label = "Found (Access Denied)"
@@ -329,23 +341,27 @@ def _web_check(url: str) -> None:
         found = True
         label = "Accessible"
     if found:
-        _mark_found(BASE, None)
+        _mark_found(BASE, None)  # type: ignore
         if url.startswith("https://"): color = "\033[1;32m"
         elif url.startswith("http://"): color = "\033[1;31m"
         else: color = "\033[0m"
-        print(f"[Web] {label}: {color}{url}\033[0m")
+        # Print directly while safely clearing current progress line.
+        with LOCK:
+            sys.stdout.write("\r" + " " * 80 + "\r")
+            print(f"[Web] {label}: {color}{url}\033[0m", flush=True)
     elif VERBOSE:
         _log(f"[Web] Not listable: {url}")
 
 
 def _run_web() -> None:
     print(f"Checking web endpoints for '{BASE}'...")
-    all_urls = []
+    all_urls: list[str] = []
     for b in [BASE] + [v for v in VARIATIONS if v != BASE]:
         all_urls.extend(list(_endpoints(b, '')))
         for r in REGIONS:
             all_urls.extend(list(_endpoints(b, r)))
     total = len(all_urls)
+    # Note: Don't reorder list; order affects early discovery speed.
     done = 0
     with cf.ThreadPoolExecutor(max_workers=THREADS) as ex:
         EXECUTORS.append(ex)
