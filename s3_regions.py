@@ -67,10 +67,10 @@ CLI_MODE_DONE  = threading.Event()          # flag to indicate CLI checks are co
 TEST_FILENAME = "Bug-Bounty-From-Production-Exploiter.txt"
 
 # User-provided message (will be set at runtime)
-TEST_CONTENT = ""
+test_content = ""
 
 # Whether to attempt DELETE after PUT
-TEST_DELETE: bool = True
+test_delete: bool = True
 
 # Local path for the temporary test file
 TEST_FILE_PATH = TDIR / TEST_FILENAME
@@ -78,36 +78,36 @@ TEST_FILE_PATH = TDIR / TEST_FILENAME
 # Helper: (re)create local test file
 def _ensure_test_file() -> Path:
     try:
-        TEST_FILE_PATH.write_text(TEST_CONTENT, encoding="utf-8")
+        TEST_FILE_PATH.write_text(test_content, encoding="utf-8")
     except Exception:
         pass
     return TEST_FILE_PATH
 
 # Get user message and options for test actions
 def _get_test_params() -> None:
-    global TEST_CONTENT, TEST_DELETE
-    if TEST_CONTENT:  # Already gathered
+    global test_content, test_delete
+    if test_content:  # Already gathered
         return
 
     # Prompt for custom message
     print("Enter the message to put in your test file (cannot be empty):")
-    while not TEST_CONTENT:
+    while not test_content:
         user_input = input("> ").strip()
         if user_input:
-            TEST_CONTENT = user_input
+            test_content = user_input
         else:
             print("Message cannot be empty. Please enter a message:")
 
     # Prompt for PUT-only or PUT+DELETE
     choice = input("Do you want to test ONLY PUT (skip DELETE)? [y/N]: ").strip().lower()
     if choice in ("y", "yes"):
-        TEST_DELETE = False
+        test_delete = False
         print("Will perform PUT checks only (no DELETE).\n")
     else:
-        TEST_DELETE = True
+        test_delete = True
         print("Will perform both PUT and DELETE checks.\n")
 
-    print(f"Using test message: '{TEST_CONTENT}'\n")
+    print(f"Using test message: '{test_content}'\n")
 
 # ────────────────────────── graceful shutdown
 def _cleanup(_sig: int | None = None, _frame: FrameType | None = None) -> None:
@@ -323,7 +323,7 @@ def _cli_probe(bucket: str) -> None:
                 except subprocess.CalledProcessError:
                     pass
 
-                if TEST_DELETE and put_ok:
+                if test_delete and put_ok:
                     try:
                         subprocess.check_output(rm_cmd, stderr=subprocess.STDOUT, text=True)
                         del_ok = True
@@ -433,7 +433,7 @@ def _web_check(url: str) -> None:
             try:
                 req_put = urllib.request.Request(
                     object_url,
-                    data=TEST_CONTENT.encode(),
+                    data=test_content.encode(),
                     method="PUT",
                     headers={"Content-Type": "text/plain"},
                 )
@@ -443,7 +443,7 @@ def _web_check(url: str) -> None:
             except Exception:
                 pass
             # DELETE request only if configured
-            if TEST_DELETE and put_ok:
+            if test_delete and put_ok:
                 try:
                     req_del = urllib.request.Request(object_url, method="DELETE")
                     with urllib.request.urlopen(req_del, context=SSL_CONTEXT if object_url.startswith("https://") else None) as resp:
