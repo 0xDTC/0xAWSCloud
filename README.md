@@ -4,11 +4,12 @@
 
 ## s3_regions.py
 
-A comprehensive S3 bucket accessibility checker that tests for publicly accessible buckets across all AWS regions, using both AWS CLI and web-based checks.
+A comprehensive S3 bucket accessibility checker that tests for publicly accessible buckets across all AWS regions, using both AWS CLI and web-based checks. Tests bucket permissions for GET, PUT, and DELETE operations to identify full write access.
 
 ### Features
 - Tests bucket accessibility via HTTP and HTTPS
 - Checks AWS CLI access across all AWS regions
+- Tests PUT and DELETE permissions via both AWS CLI and HTTP/S
 - Tests over 70 bucket name variations and patterns
 - Checks multiple URL formats for each bucket variation:
   - Direct bucket access (bucket.com)
@@ -17,7 +18,8 @@ A comprehensive S3 bucket accessibility checker that tests for publicly accessib
   - Hyphenated endpoints (bucket.s3-region.amazonaws.com)
   - Website endpoints (bucket.s3-website.region.amazonaws.com)
   - Dualstack endpoints (bucket.s3.dualstack.region.amazonaws.com)
-- Covers all AWS regions including GovCloud and China regions
+- Extended S3 feature support including requester pays settings
+- Custom message input for PUT/DELETE tests with option to skip DELETE operations across all regions
 - Color-coded output (red for HTTP, green for HTTPS)
 - Threaded concurrent processing for faster results
 - Progress counter for visibility
@@ -49,11 +51,20 @@ Example Output:
 ==== S3 Bucket Accessibility Check ====
 Base name: acme-corp.com
 Mode: Both Web and CLI checks
-[AWS CLI] Found: s3://acme-corp.com No Region (objects: 1342)
-[AWS CLI] Found: s3://acme-corp.com us-east-1 (objects: 1342)
+
+Enter the message to put in your test file (cannot be empty):
+> This is a security test. Contact security@example.com if found.
+
+Do you want to test ONLY PUT (skip DELETE)? [y/N]: n
+Will perform both PUT and DELETE checks.
+
+Using test message: 'This is a security test. Contact security@example.com if found.'
+
+[AWS CLI] Found: s3://acme-corp.com No Region (objects: 1342) (PUT, DELETE)
+[AWS CLI] Found: s3://acme-corp.com us-east-1 (objects: 1342) (PUT)
 [AWS CLI] Found: s3://acme-corp.com us-east-2 (objects: 1342)
-[Web] Accessible: http://acme-corp.com.s3.amazonaws.com
-[Web] Accessible: https://acme-corp.com.s3.amazonaws.com
+[Web] Accessible: http://acme-corp.com.s3.amazonaws.com (PUT, DELETE)
+[Web] Accessible: https://acme-corp.com.s3.amazonaws.com (DELETE)
 [Web] Accessible: http://acme-corp.com.s3.us-west-2.amazonaws.com
 
 Base bucket 'acme-corp.com' is accessible!
@@ -62,23 +73,37 @@ Base bucket 'acme-corp.com' is accessible!
 ### Workflow
 1. Parse command line arguments
 2. Initialize variables and regions list
-3. Generate bucket name variations
-4. If CLI checks enabled:
+3. Prompt user for:
+   - Custom message to use in test file
+   - Whether to test only PUT operations or both PUT and DELETE
+4. Generate bucket name variations
+5. If CLI checks enabled:
    - Check bucket accessibility via AWS CLI across all regions
    - Track number of objects in each accessible bucket
-5. If Web checks enabled:
+   - Always test PUT operations with AWS CLI (--no-sign-request) using custom message
+   - If enabled, test DELETE operations only after successful PUT
+   - Report which write operations succeed for each accessible bucket
+6. If Web checks enabled:
    - Generate all endpoint URLs for each bucket variation
    - Check HTTP/HTTPS accessibility of each URL concurrently
    - Detect S3 bucket listings via `<ListBucketResult xmlns=` pattern
-   - Report accessible buckets with color-coded URLs
-6. Display summary of results
+   - Always test PUT operations via HTTP/S for accessible buckets
+   - If enabled, test DELETE operations only after successful PUT
+   - Report accessible buckets with color-coded URLs and write permissions
+7. Display summary of results
 
 ### Visual Workflow Diagram
 ```mermaid
 graph TD
     A[Start] --> B[Parse Arguments]
     B --> C[Initialize Variables & Regions]
-    C --> D[Generate Bucket Variations]
+    C --> C1[Prompt for Custom Message]
+    C1 --> C1a{Test DELETE?}
+    C1a -->|Yes| C2a[Configure PUT+DELETE Testing]
+    C1a -->|No| C2b[Configure PUT-only Testing]
+    C2a & C2b --> C3[Create Test File with Custom Message]
+    
+    C3 --> D[Generate Bucket Variations]
     
     D --> E{Check Mode}
     E -->|CLI Mode| F[AWS CLI Checks]
@@ -87,13 +112,19 @@ graph TD
     
     F --> F1[Probe Each Region with AWS CLI]
     F1 --> F2[Process Results]
-    F2 --> F3[Mark Found Buckets]
+    F2 --> F2a[Test PUT with AWS CLI]
+    
+    F2a -->|PUT Success & DELETE Enabled| F2b[Test DELETE with AWS CLI]
+    F2a & F2b --> F3[Mark Found Buckets with Permissions]
     
     G --> G1[Generate All URL Patterns]
     G1 --> G2[Thread Pool for Web Checks]
     G2 --> G3[Check URLs Concurrently]
     G3 --> G4[Detect Valid S3 Responses]
-    G4 --> G5[Mark Found Buckets]
+    G4 --> G4a[Test PUT via HTTP/S]
+    
+    G4a -->|PUT Success & DELETE Enabled| G4b[Test DELETE via HTTP/S]
+    G4a & G4b --> G5[Mark Found Buckets with Permissions]
     
     F3 --> Z[Display Results]
     G5 --> Z
@@ -102,6 +133,8 @@ graph TD
     subgraph "CLI Probe"
     F1
     F2
+    F2a
+    F2b
     F3
     end
     
@@ -110,6 +143,8 @@ graph TD
     G2
     G3
     G4
+    G4a
+    G4b
     G5
     end
     

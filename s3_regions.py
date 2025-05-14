@@ -63,6 +63,52 @@ BASE_FOUND     = threading.Event()          # flag for when the exact base bucke
 FOUND_BUCKETS: dict[str, set[str]] = {}        # mapping of bucket names to their found regions
 CLI_MODE_DONE  = threading.Event()          # flag to indicate CLI checks are complete
 
+# ────────────────────────── test file constants
+TEST_FILENAME = "Bug-Bounty-From-Production-Exploiter.txt"
+
+# User-provided message (will be set at runtime)
+TEST_CONTENT = ""
+
+# Whether to attempt DELETE after PUT
+TEST_DELETE: bool = True
+
+# Local path for the temporary test file
+TEST_FILE_PATH = TDIR / TEST_FILENAME
+
+# Helper: (re)create local test file
+def _ensure_test_file() -> Path:
+    try:
+        TEST_FILE_PATH.write_text(TEST_CONTENT, encoding="utf-8")
+    except Exception:
+        pass
+    return TEST_FILE_PATH
+
+# Get user message and options for test actions
+def _get_test_params() -> None:
+    global TEST_CONTENT, TEST_DELETE
+    if TEST_CONTENT:  # Already gathered
+        return
+
+    # Prompt for custom message
+    print("Enter the message to put in your test file (cannot be empty):")
+    while not TEST_CONTENT:
+        user_input = input("> ").strip()
+        if user_input:
+            TEST_CONTENT = user_input
+        else:
+            print("Message cannot be empty. Please enter a message:")
+
+    # Prompt for PUT-only or PUT+DELETE
+    choice = input("Do you want to test ONLY PUT (skip DELETE)? [y/N]: ").strip().lower()
+    if choice in ("y", "yes"):
+        TEST_DELETE = False
+        print("Will perform PUT checks only (no DELETE).\n")
+    else:
+        TEST_DELETE = True
+        print("Will perform both PUT and DELETE checks.\n")
+
+    print(f"Using test message: '{TEST_CONTENT}'\n")
+
 # ────────────────────────── graceful shutdown
 def _cleanup(_sig: int | None = None, _frame: FrameType | None = None) -> None:
     STOP_ALL.set()
@@ -249,18 +295,50 @@ def _cli_probe(bucket: str) -> None:
             continue
             
         label = "No Region" if region is None else region
-        cmd = ["aws", "s3", "ls", f"s3://{bucket}", "--no-sign-request", "--summarize"]
+        cmd = ["aws", "s3", "ls", f"s3://{bucket}", "--no-sign-request", "--summarize"] 
         if region:
             cmd += ["--region", region]
 
         try:
             out = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
             if (m := TOTAL_RE.search(out)):
+                # Perform PUT / DELETE checks via AWS CLI
+                _ensure_test_file()
+                put_ok = False
+                del_ok = False
+                cp_cmd = [
+                    "aws", "s3", "cp", str(TEST_FILE_PATH),
+                    f"s3://{bucket}/{TEST_FILENAME}", "--no-sign-request"
+                ]
+                rm_cmd = [
+                    "aws", "s3", "rm",
+                    f"s3://{bucket}/{TEST_FILENAME}", "--no-sign-request"
+                ]
+                if region:
+                    cp_cmd += ["--region", region]
+                    rm_cmd += ["--region", region]
+                try:
+                    subprocess.check_output(cp_cmd, stderr=subprocess.STDOUT, text=True)
+                    put_ok = True
+                except subprocess.CalledProcessError:
+                    pass
+
+                if TEST_DELETE and put_ok:
+                    try:
+                        subprocess.check_output(rm_cmd, stderr=subprocess.STDOUT, text=True)
+                        del_ok = True
+                    except subprocess.CalledProcessError:
+                        pass
+                flag_parts: list[str] = []
+                if put_ok: flag_parts.append("PUT")
+                if del_ok: flag_parts.append("DELETE")
+                flags = f" ({', '.join(flag_parts)})" if flag_parts else ""
+
                 _mark_found(bucket, label)
                 _log(
                     f"\033[1;33m[AWS CLI]\033[0m Found: "
                     f"\033[1;32ms3://{bucket}\033[0m {label} "
-                    f"\033[0;36m(objects: {m.group(1)})\033[0m",
+                    f"\033[0;36m(objects: {m.group(1)})\033[0m{flags}",
                     show_always=True
                 )
         except subprocess.CalledProcessError as exc:
@@ -345,10 +423,43 @@ def _web_check(url: str) -> None:
         if url.startswith("https://"): color = "\033[1;32m"
         elif url.startswith("http://"): color = "\033[1;31m"
         else: color = "\033[0m"
+
+        # Perform PUT / DELETE checks only when bucket listing accessible (label == "Accessible")
+        put_ok = False
+        del_ok = False
+        if label == "Accessible":
+            object_url = url.rstrip("/") + "/" + TEST_FILENAME
+            # PUT request
+            try:
+                req_put = urllib.request.Request(
+                    object_url,
+                    data=TEST_CONTENT.encode(),
+                    method="PUT",
+                    headers={"Content-Type": "text/plain"},
+                )
+                with urllib.request.urlopen(req_put, context=SSL_CONTEXT if object_url.startswith("https://") else None) as resp:
+                    if resp.status in (200, 201, 204):
+                        put_ok = True
+            except Exception:
+                pass
+            # DELETE request only if configured
+            if TEST_DELETE and put_ok:
+                try:
+                    req_del = urllib.request.Request(object_url, method="DELETE")
+                    with urllib.request.urlopen(req_del, context=SSL_CONTEXT if object_url.startswith("https://") else None) as resp:
+                        if resp.status in (200, 204):
+                            del_ok = True
+                except Exception:
+                    pass
+        flag_parts: list[str] = []
+        if put_ok: flag_parts.append("PUT")
+        if del_ok: flag_parts.append("DELETE")
+        flags = f" ({', '.join(flag_parts)})" if flag_parts else ""
+
         # Print directly while safely clearing current progress line.
         with LOCK:
             sys.stdout.write("\r" + " " * 80 + "\r")
-            print(f"[Web] {label}: {color}{url}\033[0m", flush=True)
+            print(f"[Web] {label}: {color}{url}\033[0m{flags}", flush=True)
     elif VERBOSE:
         _log(f"[Web] Not listable: {url}")
 
@@ -383,6 +494,8 @@ if __name__ == '__main__':
     mode = "Both Web and CLI checks" if RUN_CLI and RUN_WEB else "CLI-only" if RUN_CLI else "Web-only"
     print(f"Mode: {mode}")
     if VERBOSE: print("Verbose mode: ON")
+    # Get user message and options for test actions
+    _get_test_params()
     try:
         if RUN_CLI: _run_cli()
         if RUN_WEB: _run_web()
