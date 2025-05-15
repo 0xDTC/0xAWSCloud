@@ -19,7 +19,7 @@ A comprehensive S3 bucket accessibility checker that tests for publicly accessib
   - Website endpoints (bucket.s3-website.region.amazonaws.com)
   - Dualstack endpoints (bucket.s3.dualstack.region.amazonaws.com)
 - Extended S3 feature support including requester pays settings
-- Custom message input for PUT/DELETE tests with option to skip DELETE operations across all regions
+- Custom message input for PUT/DELETE tests with options to: test only PUT, test both PUT and DELETE, or skip all write tests
 - Color-coded output (red for HTTP, green for HTTPS)
 - Threaded concurrent processing for faster results
 - Progress counter for visibility
@@ -55,7 +55,11 @@ Mode: Both Web and CLI checks
 Enter the message to put in your test file (cannot be empty):
 > This is a security test. Contact security@example.com if found.
 
-Do you want to test ONLY PUT (skip DELETE)? [y/N]: n
+Choose testing options:
+  y - Test ONLY PUT operations (skip DELETE)
+  n - Test both PUT and DELETE operations
+  s - Skip all write tests (no PUT or DELETE)
+Your choice [y/N/s]: n
 Will perform both PUT and DELETE checks.
 
 Using test message: 'This is a security test. Contact security@example.com if found.'
@@ -75,20 +79,20 @@ Base bucket 'acme-corp.com' is accessible!
 2. Initialize variables and regions list
 3. Prompt user for:
    - Custom message to use in test file
-   - Whether to test only PUT operations or both PUT and DELETE
+   - Testing options (PUT-only, PUT+DELETE, or skip all write tests)
 4. Generate bucket name variations
 5. If CLI checks enabled:
    - Check bucket accessibility via AWS CLI across all regions
    - Track number of objects in each accessible bucket
-   - Always test PUT operations with AWS CLI (--no-sign-request) using custom message
-   - If enabled, test DELETE operations only after successful PUT
+   - If write tests enabled, test PUT operations with AWS CLI (--no-sign-request) using custom message
+   - If DELETE testing enabled, test DELETE operations only after successful PUT
    - Report which write operations succeed for each accessible bucket
 6. If Web checks enabled:
    - Generate all endpoint URLs for each bucket variation
    - Check HTTP/HTTPS accessibility of each URL concurrently
    - Detect S3 bucket listings via `<ListBucketResult xmlns=` pattern
-   - Always test PUT operations via HTTP/S for accessible buckets
-   - If enabled, test DELETE operations only after successful PUT
+   - If write tests enabled, test PUT operations via HTTP/S for accessible buckets
+   - If DELETE testing enabled, test DELETE operations only after successful PUT
    - Report accessible buckets with color-coded URLs and write permissions
 7. Display summary of results
 
@@ -98,10 +102,11 @@ graph TD
     A[Start] --> B[Parse Arguments]
     B --> C[Initialize Variables & Regions]
     C --> C1[Prompt for Custom Message]
-    C1 --> C1a{Test DELETE?}
-    C1a -->|Yes| C2a[Configure PUT+DELETE Testing]
-    C1a -->|No| C2b[Configure PUT-only Testing]
-    C2a & C2b --> C3[Create Test File with Custom Message]
+    C1 --> C1a{Testing Option?}
+    C1a -->|PUT+DELETE| C2a[Configure PUT+DELETE Testing]
+    C1a -->|PUT only| C2b[Configure PUT-only Testing]
+    C1a -->|Skip All| C2c[Skip All Write Tests]
+    C2a & C2b & C2c --> C3[Create Test File with Custom Message]
     
     C3 --> D[Generate Bucket Variations]
     
@@ -112,19 +117,23 @@ graph TD
     
     F --> F1[Probe Each Region with AWS CLI]
     F1 --> F2[Process Results]
-    F2 --> F2a[Test PUT with AWS CLI]
+    F2 --> F2x{Write Tests Enabled?}
+    F2x -->|Yes| F2a[Test PUT with AWS CLI]
+    F2x -->|No| F3[Mark Found Buckets]
     
     F2a -->|PUT Success & DELETE Enabled| F2b[Test DELETE with AWS CLI]
-    F2a & F2b --> F3[Mark Found Buckets with Permissions]
+    F2a & F2b --> F3
     
     G --> G1[Generate All URL Patterns]
     G1 --> G2[Thread Pool for Web Checks]
     G2 --> G3[Check URLs Concurrently]
     G3 --> G4[Detect Valid S3 Responses]
-    G4 --> G4a[Test PUT via HTTP/S]
+    G4 --> G4x{Write Tests Enabled?}
+    G4x -->|Yes| G4a[Test PUT via HTTP/S]
+    G4x -->|No| G5[Mark Found Buckets]
     
     G4a -->|PUT Success & DELETE Enabled| G4b[Test DELETE via HTTP/S]
-    G4a & G4b --> G5[Mark Found Buckets with Permissions]
+    G4a & G4b --> G5
     
     F3 --> Z[Display Results]
     G5 --> Z
