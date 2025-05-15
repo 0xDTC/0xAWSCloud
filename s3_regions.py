@@ -69,7 +69,8 @@ TEST_FILENAME = "Bug-Bounty-From-Production-Exploiter.txt"
 # User-provided message (will be set at runtime)
 test_content = ""
 
-# Whether to attempt DELETE after PUT
+# Whether to attempt PUT and DELETE operations
+test_put: bool = True
 test_delete: bool = True
 
 # Local path for the temporary test file
@@ -85,7 +86,7 @@ def _ensure_test_file() -> Path:
 
 # Get user message and options for test actions
 def _get_test_params() -> None:
-    global test_content, test_delete
+    global test_content, test_put, test_delete
     if test_content:  # Already gathered
         return
 
@@ -98,12 +99,23 @@ def _get_test_params() -> None:
         else:
             print("Message cannot be empty. Please enter a message:")
 
-    # Prompt for PUT-only or PUT+DELETE
-    choice = input("Do you want to test ONLY PUT (skip DELETE)? [y/N]: ").strip().lower()
-    if choice in ("y", "yes"):
+    # Prompt for test options
+    print("Choose testing options:")
+    print("  y - Test ONLY PUT operations (skip DELETE)")
+    print("  n - Test both PUT and DELETE operations")
+    print("  s - Skip all write tests (no PUT or DELETE)")
+    choice = input("Your choice [y/N/s]: ").strip().lower()
+    
+    if choice == "s":
+        test_put = False
+        test_delete = False
+        print("Will skip all write tests (no PUT or DELETE).\n")
+    elif choice in ("y", "yes"):
+        test_put = True
         test_delete = False
         print("Will perform PUT checks only (no DELETE).\n")
     else:
+        test_put = True
         test_delete = True
         print("Will perform both PUT and DELETE checks.\n")
 
@@ -317,18 +329,22 @@ def _cli_probe(bucket: str) -> None:
                 if region:
                     cp_cmd += ["--region", region]
                     rm_cmd += ["--region", region]
-                try:
-                    subprocess.check_output(cp_cmd, stderr=subprocess.STDOUT, text=True)
-                    put_ok = True
-                except subprocess.CalledProcessError:
-                    pass
-
-                if test_delete and put_ok:
+                
+                # Only attempt PUT if enabled
+                if test_put:
                     try:
-                        subprocess.check_output(rm_cmd, stderr=subprocess.STDOUT, text=True)
-                        del_ok = True
+                        subprocess.check_output(cp_cmd, stderr=subprocess.STDOUT, text=True)
+                        put_ok = True
                     except subprocess.CalledProcessError:
                         pass
+
+                    # Only attempt DELETE if enabled and PUT succeeded
+                    if test_delete and put_ok:
+                        try:
+                            subprocess.check_output(rm_cmd, stderr=subprocess.STDOUT, text=True)
+                            del_ok = True
+                        except subprocess.CalledProcessError:
+                            pass
                 flag_parts: list[str] = []
                 if put_ok: flag_parts.append("PUT")
                 if del_ok: flag_parts.append("DELETE")
@@ -429,28 +445,29 @@ def _web_check(url: str) -> None:
         del_ok = False
         if label == "Accessible":
             object_url = url.rstrip("/") + "/" + TEST_FILENAME
-            # PUT request
-            try:
-                req_put = urllib.request.Request(
-                    object_url,
-                    data=test_content.encode(),
-                    method="PUT",
-                    headers={"Content-Type": "text/plain"},
-                )
-                with urllib.request.urlopen(req_put, context=SSL_CONTEXT if object_url.startswith("https://") else None) as resp:
-                    if resp.status in (200, 201, 204):
-                        put_ok = True
-            except Exception:
-                pass
-            # DELETE request only if configured
-            if test_delete and put_ok:
+            # PUT request only if enabled
+            if test_put:
                 try:
-                    req_del = urllib.request.Request(object_url, method="DELETE")
-                    with urllib.request.urlopen(req_del, context=SSL_CONTEXT if object_url.startswith("https://") else None) as resp:
-                        if resp.status in (200, 204):
-                            del_ok = True
+                    req_put = urllib.request.Request(
+                        object_url,
+                        data=test_content.encode(),
+                        method="PUT",
+                        headers={"Content-Type": "text/plain"},
+                    )
+                    with urllib.request.urlopen(req_put, context=SSL_CONTEXT if object_url.startswith("https://") else None) as resp:
+                        if resp.status in (200, 201, 204):
+                            put_ok = True
                 except Exception:
                     pass
+                # DELETE request only if both PUT and DELETE are enabled and PUT succeeded
+                if test_delete and put_ok:
+                    try:
+                        req_del = urllib.request.Request(object_url, method="DELETE")
+                        with urllib.request.urlopen(req_del, context=SSL_CONTEXT if object_url.startswith("https://") else None) as resp:
+                            if resp.status in (200, 204):
+                                del_ok = True
+                    except Exception:
+                        pass
         flag_parts: list[str] = []
         if put_ok: flag_parts.append("PUT")
         if del_ok: flag_parts.append("DELETE")
