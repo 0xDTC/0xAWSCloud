@@ -90,36 +90,39 @@ def _get_test_params() -> None:
     if test_content:  # Already gathered
         return
 
-    # Prompt for custom message
-    print("Enter the message to put in your test file (cannot be empty):")
-    while not test_content:
-        user_input = input("> ").strip()
-        if user_input:
-            test_content = user_input
-        else:
-            print("Message cannot be empty. Please enter a message:")
-
-    # Prompt for test options
-    print("Choose testing options:")
-    print("  y - Test ONLY PUT operations (skip DELETE)")
-    print("  n - Test both PUT and DELETE operations")
+    # First prompt for test options
+    print("\nChoose testing options:")
+    print("  p - Test ONLY PUT operations (skip DELETE)")
+    print("  b - Test both PUT and DELETE operations")
     print("  s - Skip all write tests (no PUT or DELETE)")
-    choice = input("Your choice [y/N/s]: ").strip().lower()
+    choice = input("Your choice [b/p/s]: ").strip().lower()
     
     if choice == "s":
         test_put = False
         test_delete = False
         print("Will skip all write tests (no PUT or DELETE).\n")
-    elif choice in ("y", "yes"):
+    elif choice in ("p", "put"):
         test_put = True
         test_delete = False
         print("Will perform PUT checks only (no DELETE).\n")
-    else:
+    else:  # Default to both
         test_put = True
         test_delete = True
         print("Will perform both PUT and DELETE checks.\n")
-
-    print(f"Using test message: '{test_content}'\n")
+    
+    # Only prompt for message if write tests are enabled
+    if test_put:
+        print("Enter the message to put in your test file (cannot be empty):")
+        while not test_content:
+            user_input = input("> ").strip()
+            if user_input:
+                test_content = user_input
+            else:
+                print("Message cannot be empty. Please enter a message:")
+        print(f"Using test message: '{test_content}'\n")
+    else:
+        # Set a placeholder message even if not used
+        test_content = "No write tests enabled"
 
 # ────────────────────────── graceful shutdown
 def _cleanup(_sig: int | None = None, _frame: FrameType | None = None) -> None:

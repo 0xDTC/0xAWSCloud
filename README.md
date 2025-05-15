@@ -19,7 +19,7 @@ A comprehensive S3 bucket accessibility checker that tests for publicly accessib
   - Website endpoints (bucket.s3-website.region.amazonaws.com)
   - Dualstack endpoints (bucket.s3.dualstack.region.amazonaws.com)
 - Extended S3 feature support including requester pays settings
-- Custom message input for PUT/DELETE tests with options to: test only PUT, test both PUT and DELETE, or skip all write tests
+- Flexible testing options: test only PUT, test both PUT and DELETE, or skip all write tests entirely
 - Color-coded output (red for HTTP, green for HTTPS)
 - Threaded concurrent processing for faster results
 - Progress counter for visibility
@@ -52,16 +52,15 @@ Example Output:
 Base name: acme-corp.com
 Mode: Both Web and CLI checks
 
-Enter the message to put in your test file (cannot be empty):
-> This is a security test. Contact security@example.com if found.
-
 Choose testing options:
-  y - Test ONLY PUT operations (skip DELETE)
-  n - Test both PUT and DELETE operations
+  p - Test ONLY PUT operations (skip DELETE)
+  b - Test both PUT and DELETE operations
   s - Skip all write tests (no PUT or DELETE)
-Your choice [y/N/s]: n
+Your choice [b/p/s]: b
 Will perform both PUT and DELETE checks.
 
+Enter the message to put in your test file (cannot be empty):
+> This is a security test. Contact security@example.com if found.
 Using test message: 'This is a security test. Contact security@example.com if found.'
 
 [AWS CLI] Found: s3://acme-corp.com No Region (objects: 1342) (PUT, DELETE)
@@ -77,38 +76,39 @@ Base bucket 'acme-corp.com' is accessible!
 ### Workflow
 1. Parse command line arguments
 2. Initialize variables and regions list
-3. Prompt user for:
-   - Custom message to use in test file
-   - Testing options (PUT-only, PUT+DELETE, or skip all write tests)
-4. Generate bucket name variations
-5. If CLI checks enabled:
+3. Prompt user for testing options first (PUT-only, PUT+DELETE, or skip all write tests)
+4. If write tests are enabled, prompt for a custom message to use in the test file
+5. Generate bucket name variations
+6. If CLI checks enabled:
    - Check bucket accessibility via AWS CLI across all regions
    - Track number of objects in each accessible bucket
    - If write tests enabled, test PUT operations with AWS CLI (--no-sign-request) using custom message
    - If DELETE testing enabled, test DELETE operations only after successful PUT
    - Report which write operations succeed for each accessible bucket
-6. If Web checks enabled:
+7. If Web checks enabled:
    - Generate all endpoint URLs for each bucket variation
    - Check HTTP/HTTPS accessibility of each URL concurrently
    - Detect S3 bucket listings via `<ListBucketResult xmlns=` pattern
    - If write tests enabled, test PUT operations via HTTP/S for accessible buckets
    - If DELETE testing enabled, test DELETE operations only after successful PUT
    - Report accessible buckets with color-coded URLs and write permissions
-7. Display summary of results
+8. Display summary of results
 
 ### Visual Workflow Diagram
 ```mermaid
 graph TD
     A[Start] --> B[Parse Arguments]
     B --> C[Initialize Variables & Regions]
-    C --> C1[Prompt for Custom Message]
-    C1 --> C1a{Testing Option?}
+    C --> C1a{Choose Testing Option}
     C1a -->|PUT+DELETE| C2a[Configure PUT+DELETE Testing]
     C1a -->|PUT only| C2b[Configure PUT-only Testing]
     C1a -->|Skip All| C2c[Skip All Write Tests]
-    C2a & C2b & C2c --> C3[Create Test File with Custom Message]
     
-    C3 --> D[Generate Bucket Variations]
+    C2a & C2b --> C3[Prompt for Custom Message]
+    C3 --> C4[Create Test File]
+    C2c --> C4
+    
+    C4 --> D[Generate Bucket Variations]
     
     D --> E{Check Mode}
     E -->|CLI Mode| F[AWS CLI Checks]
