@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """
-s3_regions.py – scan for publicly-listable S3 buckets derived from a base name.
+s3_regions.py – scan for publicly-listable S3 buckets across regions.
 
 Usage
 ─────
-  ./s3_regions.py -b examplebucket          # web + CLI (default)
-  ./s3_regions.py -b examplebucket -w       # web only
-  ./s3_regions.py -b examplebucket -c       # CLI only
+  ./s3_regions.py -b examplebucket          # Check single bucket across all regions (default)
+  ./s3_regions.py -b examplebucket -n       # Check bucket name variations across regions  
+  ./s3_regions.py -l buckets.txt -w         # Check all buckets from file (web checks only)
+  ./s3_regions.py -l buckets.txt -c         # Check all buckets from file (CLI checks only)
+  ./s3_regions.py -l buckets.txt -n -w      # Check all buckets from file with name variations
+  ./s3_regions.py -b examplebucket -w       # Web checks only
+  ./s3_regions.py -b examplebucket -c       # CLI checks only
+
+Note: When using -l flag, -w or -c must be specified to prevent accidental resource-intensive scans.
 """
 
 from __future__ import annotations
@@ -29,17 +35,63 @@ import ssl
 
 # ────────────────────────── CLI flags
 PAR = argparse.ArgumentParser(description="S3 bucket accessibility checker")
-PAR.add_argument("-b", "--bucket", required=True, help="Base bucket name")
+
+# Bucket input options (mutually exclusive)
+BUCKET_GROUP = PAR.add_mutually_exclusive_group(required=True)
+BUCKET_GROUP.add_argument("-b", "--bucket", help="Single bucket name to check")
+BUCKET_GROUP.add_argument("-l", "--list", help="File containing list of bucket names (one per line)")
+
+# Check mode options (mutually exclusive)
 MEX = PAR.add_mutually_exclusive_group()
 MEX.add_argument("-w", "--web-only", action="store_true", help="Web checks only")
 MEX.add_argument("-c", "--cli-only", action="store_true", help="CLI checks only")
+
+# Other options
+PAR.add_argument("-n", "--name-variations", action="store_true", help="Search for bucket name variations (dev-, -prod, etc.)")
 PAR.add_argument("-v", "--verbose", action="store_true", help="Show all access attempts (verbose mode)")
 PAR.add_argument("-t", "--threads", type=int, default=30, help="Concurrent threads for web checks (default: 30)")
 ARGS = PAR.parse_args()
 
-BASE: str = ARGS.bucket.strip()
+# Parse bucket input
+def _load_bucket_names() -> list[str]:
+    """Load bucket names from either single bucket or file list."""
+    if ARGS.bucket:
+        return [ARGS.bucket.strip()]
+    elif ARGS.list:
+        try:
+            with open(ARGS.list, 'r', encoding='utf-8') as f:
+                buckets: list[str] = []
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):  # Skip empty lines and comments
+                        buckets.append(line)
+                return buckets
+        except FileNotFoundError:
+            print(f"Error: File '{ARGS.list}' not found.")
+            sys.exit(1)
+        except Exception as e:
+            print(f"Error reading file '{ARGS.list}': {e}")
+            sys.exit(1)
+    else:
+        print("Error: Either -b or -l must be specified.")
+        sys.exit(1)
+
+BASE_BUCKETS: list[str] = _load_bucket_names()
+BASE: str = BASE_BUCKETS[0]  # For backward compatibility with existing code
+
+# Validation: When using -l flag, -w or -c must be specified
+if ARGS.list and not (ARGS.web_only or ARGS.cli_only):
+    print("Error: When using -l/--list flag, you must specify either -w/--web-only or -c/--cli-only (or both).")
+    print("This is required for bulk operations to prevent accidental resource-intensive scans.")
+    print("\nExamples:")
+    print("  python s3_regions.py -l buckets.txt -w    # Web checks only")
+    print("  python s3_regions.py -l buckets.txt -c    # CLI checks only")
+    print("  python s3_regions.py -l buckets.txt -w -c # Both (not recommended for large lists)")
+    sys.exit(1)
+
 RUN_WEB: bool = not ARGS.cli_only
 RUN_CLI: bool = not ARGS.web_only
+NAME_VARIATIONS: bool = ARGS.name_variations
 VERBOSE: bool = ARGS.verbose
 THREADS: int = ARGS.threads
 
@@ -132,16 +184,16 @@ def _cleanup(_sig: int | None = None, _frame: FrameType | None = None) -> None:
             ex.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
-    try:
-        if TDIR.exists():
-            TDIR.rmdir()
-    except Exception:
-        pass
     if CHECKED_SET:
         try:
             Path(TDIR / "checked_urls").write_text("\n".join(sorted(CHECKED_SET)))
         except Exception:
             pass
+    try:
+        if TDIR.exists():
+            shutil.rmtree(TDIR)
+    except Exception:
+        pass
     os._exit(130 if _sig in (signal.SIGINT, signal.SIGTERM) else 0)
 
 signal.signal(signal.SIGINT, _cleanup)
@@ -267,7 +319,20 @@ def _variations(b: str) -> list[str]:
     ]
     # Remove duplicates while preserving order
     return list(dict.fromkeys(v))
-VARIATIONS = _variations(BASE)
+
+# Generate variations for all base buckets if -n flag is used
+def _get_all_variations() -> list[str]:
+    """Get all bucket variations based on flags."""
+    if NAME_VARIATIONS:
+        all_variations: list[str] = []
+        for bucket in BASE_BUCKETS:
+            all_variations.extend(_variations(bucket))
+        # Remove duplicates while preserving order
+        return list(dict.fromkeys(all_variations))
+    else:
+        return BASE_BUCKETS
+
+VARIATIONS = _get_all_variations()
 
 # ────────────────────────── AWS-CLI probe
 TOTAL_RE = re.compile(r"Total\s+Objects:\s+(\d+)")
@@ -286,14 +351,8 @@ def _error_code(text: str) -> str:
 
 
 def _cli_probe(bucket: str) -> None:
-    """Check a single bucket across all AWS regions.
-    Only checks the exact bucket name, no variations.
-    """
+    """Check a single bucket across all AWS regions."""
     if STOP_ALL.is_set():
-        return
-    
-    # Only process if this is the exact base bucket
-    if bucket != BASE:
         return
         
     total_regions = len(REGIONS) + 1  # +1 for the None region
@@ -362,23 +421,31 @@ def _cli_probe(bucket: str) -> None:
                 )
         except subprocess.CalledProcessError as exc:
             # Always log errors on failed ls attempts
-                code = _error_code(exc.output)
-                _log(
-                    f"\033[1;31m[AWS CLI]\033[0m Not accessible: "
-                    f"\033[1;32ms3://{bucket}\033[0m {label} ({code})",
-                    show_always=True
-                )
+            code = _error_code(exc.output)
+            _log(
+                f"\033[1;31m[AWS CLI]\033[0m Not accessible: "
+                f"\033[1;32ms3://{bucket}\033[0m {label} ({code})",
+                show_always=True
+            )
 
 
 def _run_cli() -> None:
-    """Only probe the exact BASE bucket across every region.
-    No name variations are checked in CLI mode.
+    """Probe bucket(s) across every region.
+    Checks name variations only if -n flag is used.
     """
     # Reset CLI_MODE_DONE flag
     CLI_MODE_DONE.clear()
     
-    # Run CLI checks
-    _cli_probe(BASE)
+    bucket_count = len(BASE_BUCKETS)
+    variation_count = len(VARIATIONS)
+    mode_text = f"{bucket_count} base bucket(s)" if not NAME_VARIATIONS else f"{variation_count} bucket variation(s)"
+    print(f"Checking CLI access for {mode_text} across {len(REGIONS)} regions...")
+    
+    # Run CLI checks for all variations
+    for bucket in VARIATIONS:
+        if STOP_ALL.is_set():
+            break
+        _cli_probe(bucket)
     
     # Set flag to indicate CLI checks are done
     CLI_MODE_DONE.set()
@@ -438,7 +505,13 @@ def _web_check(url: str) -> None:
         found = True
         label = "Accessible"
     if found:
-        _mark_found(BASE, None)  # type: ignore
+        # Extract bucket name from URL for proper tracking
+        bucket_name = None
+        for variation in VARIATIONS:
+            if variation in url:
+                bucket_name = variation
+                break
+        _mark_found(bucket_name or BASE, None)  # type: ignore
         if url.startswith("https://"): color = "\033[1;32m"
         elif url.startswith("http://"): color = "\033[1;31m"
         else: color = "\033[0m"
@@ -485,12 +558,25 @@ def _web_check(url: str) -> None:
 
 
 def _run_web() -> None:
-    print(f"Checking web endpoints for '{BASE}'...")
+    bucket_count = len(BASE_BUCKETS)
+    variation_count = len(VARIATIONS)
+    
+    if len(BASE_BUCKETS) == 1 and not NAME_VARIATIONS:
+        bucket_text = f"bucket '{BASE}'"
+    elif NAME_VARIATIONS:
+        bucket_text = f"{variation_count} bucket variation(s)"
+    else:
+        bucket_text = f"{bucket_count} bucket(s)"
+    
+    print(f"Checking web endpoints for {bucket_text}...")
     all_urls: list[str] = []
-    for b in [BASE] + [v for v in VARIATIONS if v != BASE]:
+    
+    # Use VARIATIONS list which respects the -n flag
+    for b in VARIATIONS:
         all_urls.extend(list(_endpoints(b, '')))
         for r in REGIONS:
             all_urls.extend(list(_endpoints(b, r)))
+    
     total = len(all_urls)
     # Note: Don't reorder list; order affects early discovery speed.
     done = 0
@@ -510,9 +596,23 @@ if __name__ == '__main__':
         print("Error: AWS CLI not found. Install or use --web-only.")
         sys.exit(1)
     print("==== S3 Bucket Accessibility Check ====")
-    print(f"Base name: {BASE}")
-    mode = "Both Web and CLI checks" if RUN_CLI and RUN_WEB else "CLI-only" if RUN_CLI else "Web-only"
-    print(f"Mode: {mode}")
+    
+    # Display input information
+    if len(BASE_BUCKETS) == 1:
+        print(f"Base name: {BASE}")
+    else:
+        print(f"Input: {len(BASE_BUCKETS)} buckets from file '{ARGS.list}'")
+        if VERBOSE:
+            print(f"Bucket names: {', '.join(BASE_BUCKETS[:5])}" + ("..." if len(BASE_BUCKETS) > 5 else ""))
+    
+    # Display mode information
+    check_mode = "Both Web and CLI checks" if RUN_CLI and RUN_WEB else "CLI-only" if RUN_CLI else "Web-only"
+    if NAME_VARIATIONS:
+        variation_mode = f"with name variations ({len(VARIATIONS)} total)"
+    else:
+        variation_mode = f"exact names only ({len(VARIATIONS)} total)"
+    print(f"Mode: {check_mode} ({variation_mode})")
+    print(f"Regions to check: {len(REGIONS)}")
     if VERBOSE: print("Verbose mode: ON")
     # Get user message and options for test actions
     _get_test_params()
@@ -522,9 +622,24 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         print("\nSearch interrupted by user.")
     finally:
-        if BASE in FOUND_BUCKETS:
-            print(f"\nBase bucket '{BASE}' is accessible!")
-        else:
-            print(f"\nFound {len(FOUND_BUCKETS)} accessible bucket(s), but not the base bucket '{BASE}'.")
+        # Summary of findings
+        found_base_buckets = [bucket for bucket in BASE_BUCKETS if bucket in FOUND_BUCKETS]
+        
+        if found_base_buckets:
+            if len(BASE_BUCKETS) == 1:
+                print(f"\nBase bucket '{BASE}' is accessible!")
+            else:
+                print(f"\nFound {len(found_base_buckets)} accessible base bucket(s): {', '.join(found_base_buckets)}")
+        
+        if FOUND_BUCKETS and len(FOUND_BUCKETS) > len(found_base_buckets):
+            additional_found = len(FOUND_BUCKETS) - len(found_base_buckets)
+            print(f"Found {additional_found} additional accessible bucket variation(s).")
+        
         if not FOUND_BUCKETS:
             print("No accessible buckets found.")
+        
+        if FOUND_BUCKETS and VERBOSE:
+            print(f"\nAll accessible buckets found:")
+            for bucket, regions in FOUND_BUCKETS.items():
+                region_text = f" (regions: {', '.join(sorted(regions))})" if regions else ""
+                print(f"  - {bucket}{region_text}")
