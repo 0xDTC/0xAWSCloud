@@ -144,23 +144,23 @@ def _get_test_params() -> None:
 
     # First prompt for test options
     print("\nChoose testing options:")
-    print("  p - Test ONLY PUT operations (skip DELETE)")
-    print("  b - Test both PUT and DELETE operations")
-    print("  s - Skip all write tests (no PUT or DELETE)")
+    print("  p - Test PUT and GET operations (skip DELETE)")
+    print("  b - Test PUT, GET, and DELETE operations")
+    print("  s - Skip all write tests (no PUT, GET, or DELETE)")
     choice = input("Your choice [b/p/s]: ").strip().lower()
     
     if choice == "s":
         test_put = False
         test_delete = False
-        print("Will skip all write tests (no PUT or DELETE).\n")
+        print("Will skip all write tests (no PUT, GET, or DELETE).\n")
     elif choice in ("p", "put"):
         test_put = True
         test_delete = False
-        print("Will perform PUT checks only (no DELETE).\n")
+        print("Will perform PUT and GET checks only (no DELETE).\n")
     else:  # Default to both
         test_put = True
         test_delete = True
-        print("Will perform both PUT and DELETE checks.\n")
+        print("Will perform PUT, GET, and DELETE checks.\n")
     
     # Only prompt for message if write tests are enabled
     if test_put:
@@ -373,55 +373,91 @@ def _cli_probe(bucket: str) -> None:
         if region:
             cmd += ["--region", region]
 
+        bucket_accessible = False
+        object_count = None
+        error_output = ""
+        
         try:
             out = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
             if (m := TOTAL_RE.search(out)):
-                # Perform PUT / DELETE checks via AWS CLI
-                _ensure_test_file()
-                put_ok = False
-                del_ok = False
-                cp_cmd = [
-                    "aws", "s3", "cp", str(TEST_FILE_PATH),
-                    f"s3://{bucket}/{TEST_FILENAME}", "--no-sign-request"
-                ]
-                rm_cmd = [
-                    "aws", "s3", "rm",
-                    f"s3://{bucket}/{TEST_FILENAME}", "--no-sign-request"
-                ]
-                if region:
-                    cp_cmd += ["--region", region]
-                    rm_cmd += ["--region", region]
-                
-                # Only attempt PUT if enabled
-                if test_put:
-                    try:
-                        subprocess.check_output(cp_cmd, stderr=subprocess.STDOUT, text=True)
-                        put_ok = True
-                    except subprocess.CalledProcessError:
-                        pass
+                bucket_accessible = True
+                object_count = m.group(1)
+        except subprocess.CalledProcessError as exc:
+            error_output = exc.output
+            # Continue to test operations even if listing fails
+        
+        # Test PUT, GET, DELETE operations regardless of listing result
+        _ensure_test_file()
+        put_ok = False
+        get_ok = False
+        del_ok = False
+        
+        cp_put_cmd = [
+            "aws", "s3", "cp", str(TEST_FILE_PATH),
+            f"s3://{bucket}/{TEST_FILENAME}", "--no-sign-request"
+        ]
+        cp_get_cmd = [
+            "aws", "s3", "cp", f"s3://{bucket}/{TEST_FILENAME}",
+            str(TDIR / f"downloaded_{TEST_FILENAME}"), "--no-sign-request"
+        ]
+        rm_cmd = [
+            "aws", "s3", "rm",
+            f"s3://{bucket}/{TEST_FILENAME}", "--no-sign-request"
+        ]
+        if region:
+            cp_put_cmd += ["--region", region]
+            cp_get_cmd += ["--region", region]
+            rm_cmd += ["--region", region]
+        
+        # Test PUT operation if enabled
+        if test_put:
+            try:
+                subprocess.check_output(cp_put_cmd, stderr=subprocess.STDOUT, text=True)
+                put_ok = True
+            except subprocess.CalledProcessError:
+                pass
 
-                    # Only attempt DELETE if enabled and PUT succeeded
-                    if test_delete and put_ok:
-                        try:
-                            subprocess.check_output(rm_cmd, stderr=subprocess.STDOUT, text=True)
-                            del_ok = True
-                        except subprocess.CalledProcessError:
-                            pass
-                flag_parts: list[str] = []
-                if put_ok: flag_parts.append("PUT")
-                if del_ok: flag_parts.append("DELETE")
-                flags = f" ({', '.join(flag_parts)})" if flag_parts else ""
+        # Test GET operation (try to get the file we just put, or any existing file)
+        if put_ok:
+            try:
+                subprocess.check_output(cp_get_cmd, stderr=subprocess.STDOUT, text=True)
+                get_ok = True
+            except subprocess.CalledProcessError:
+                pass
 
-                _mark_found(bucket, label)
+        # Test DELETE operation if enabled and PUT succeeded
+        if test_delete and put_ok:
+            try:
+                subprocess.check_output(rm_cmd, stderr=subprocess.STDOUT, text=True)
+                del_ok = True
+            except subprocess.CalledProcessError:
+                pass
+
+        # Report results if any operation succeeded or bucket was accessible
+        if bucket_accessible or put_ok or get_ok or del_ok:
+            flag_parts: list[str] = []
+            if put_ok: flag_parts.append("PUT")
+            if get_ok: flag_parts.append("GET")
+            if del_ok: flag_parts.append("DELETE")
+            flags = f" ({', '.join(flag_parts)})" if flag_parts else ""
+
+            _mark_found(bucket, label)
+            if bucket_accessible:
                 _log(
                     f"\033[1;33m[AWS CLI]\033[0m Found: "
                     f"\033[1;32ms3://{bucket}\033[0m {label} "
-                    f"\033[0;36m(objects: {m.group(1)})\033[0m{flags}",
+                    f"\033[0;36m(objects: {object_count})\033[0m{flags}",
                     show_always=True
                 )
-        except subprocess.CalledProcessError as exc:
-            # Always log errors on failed ls attempts
-            code = _error_code(exc.output)
+            else:
+                _log(
+                    f"\033[1;33m[AWS CLI]\033[0m Access Denied (but operations work): "
+                    f"\033[1;32ms3://{bucket}\033[0m {label}{flags}",
+                    show_always=True
+                )
+        else:
+            # Log when nothing worked
+            code = _error_code(error_output) if error_output else "No operations succeeded"
             _log(
                 f"\033[1;31m[AWS CLI]\033[0m Not accessible: "
                 f"\033[1;32ms3://{bucket}\033[0m {label} ({code})",
@@ -496,15 +532,60 @@ def _web_check(url: str) -> None:
         if url in CHECKED_SET or STOP_ALL.is_set(): return
         CHECKED_SET.add(url)
     status, body, _ = _fetch(url)
-    found = False
+    
+    # Check if bucket exists/accessible via listing
+    bucket_accessible = False
     label = ""
     if status == 403 and 'AccessDenied' in body and not any(x in body for x in ('NoSuchBucket','InvalidBucketName')):
-        found = True
+        bucket_accessible = True
         label = "Found (Access Denied)"
     elif status == 200 and '<ListBucketResult xmlns=' in body and not any(e in body for e in ("NoSuchBucket","InvalidBucketName")):
-        found = True
+        bucket_accessible = True
         label = "Accessible"
-    if found:
+    
+    # Test PUT, GET, DELETE operations regardless of listing result
+    object_url = url.rstrip("/") + "/" + TEST_FILENAME
+    put_ok = False
+    get_ok = False
+    del_ok = False
+    
+    # Test PUT operation if enabled
+    if test_put:
+        try:
+            req_put = urllib.request.Request(
+                object_url,
+                data=test_content.encode(),
+                method="PUT",
+                headers={"Content-Type": "text/plain"},
+            )
+            with urllib.request.urlopen(req_put, context=SSL_CONTEXT if object_url.startswith("https://") else None) as resp:
+                if resp.status in (200, 201, 204):
+                    put_ok = True
+        except Exception:
+            pass
+    
+    # Test GET operation (try to get the file we just put)
+    if put_ok:
+        try:
+            req_get = urllib.request.Request(object_url, method="GET")
+            with urllib.request.urlopen(req_get, context=SSL_CONTEXT if object_url.startswith("https://") else None) as resp:
+                if resp.status == 200:
+                    get_ok = True
+        except Exception:
+            pass
+    
+    # Test DELETE operation if enabled and PUT succeeded
+    if test_delete and put_ok:
+        try:
+            req_del = urllib.request.Request(object_url, method="DELETE")
+            with urllib.request.urlopen(req_del, context=SSL_CONTEXT if object_url.startswith("https://") else None) as resp:
+                if resp.status in (200, 204):
+                    del_ok = True
+        except Exception:
+            pass
+    
+    # Report results if any operation succeeded or bucket was accessible
+    if bucket_accessible or put_ok or get_ok or del_ok:
         # Extract bucket name from URL for proper tracking
         bucket_name = None
         for variation in VARIATIONS:
@@ -512,47 +593,27 @@ def _web_check(url: str) -> None:
                 bucket_name = variation
                 break
         _mark_found(bucket_name or BASE, None)  # type: ignore
+        
         if url.startswith("https://"): color = "\033[1;32m"
         elif url.startswith("http://"): color = "\033[1;31m"
         else: color = "\033[0m"
 
-        # Perform PUT / DELETE checks only when bucket listing accessible (label == "Accessible")
-        put_ok = False
-        del_ok = False
-        if label == "Accessible":
-            object_url = url.rstrip("/") + "/" + TEST_FILENAME
-            # PUT request only if enabled
-            if test_put:
-                try:
-                    req_put = urllib.request.Request(
-                        object_url,
-                        data=test_content.encode(),
-                        method="PUT",
-                        headers={"Content-Type": "text/plain"},
-                    )
-                    with urllib.request.urlopen(req_put, context=SSL_CONTEXT if object_url.startswith("https://") else None) as resp:
-                        if resp.status in (200, 201, 204):
-                            put_ok = True
-                except Exception:
-                    pass
-                # DELETE request only if both PUT and DELETE are enabled and PUT succeeded
-                if test_delete and put_ok:
-                    try:
-                        req_del = urllib.request.Request(object_url, method="DELETE")
-                        with urllib.request.urlopen(req_del, context=SSL_CONTEXT if object_url.startswith("https://") else None) as resp:
-                            if resp.status in (200, 204):
-                                del_ok = True
-                    except Exception:
-                        pass
         flag_parts: list[str] = []
         if put_ok: flag_parts.append("PUT")
+        if get_ok: flag_parts.append("GET")
         if del_ok: flag_parts.append("DELETE")
         flags = f" ({', '.join(flag_parts)})" if flag_parts else ""
+
+        # Determine final label
+        if bucket_accessible:
+            final_label = label
+        else:
+            final_label = "Access Denied (but operations work)"
 
         # Print directly while safely clearing current progress line.
         with LOCK:
             sys.stdout.write("\r" + " " * 80 + "\r")
-            print(f"[Web] {label}: {color}{url}\033[0m{flags}", flush=True)
+            print(f"[Web] {final_label}: {color}{url}\033[0m{flags}", flush=True)
     elif VERBOSE:
         _log(f"[Web] Not listable: {url}")
 

@@ -4,19 +4,19 @@
 
 ## s3_regions.py
 
-A comprehensive S3 bucket accessibility checker that tests for publicly accessible buckets across all AWS regions, using both AWS CLI and web-based checks. Tests bucket permissions for GET, PUT, and DELETE operations to identify full write access.
+A comprehensive S3 bucket accessibility checker that tests for publicly accessible buckets across all AWS regions, using both AWS CLI and web-based checks. Tests bucket permissions for PUT, GET, and DELETE operations to identify full write access even when bucket listing is denied.
 
 ### Features
 - **Single & Bulk Mode**: Check individual buckets or lists from files
 - **Name Variations**: Generate and test common bucket naming patterns (optional)
 - **Multi-Region Scanning**: Checks buckets across all AWS regions
 - **Dual Testing**: Both AWS CLI and web-based endpoint testing
-- **Write Operations**: Test PUT and DELETE operations on accessible buckets
+- **Write Operations**: Test PUT, GET, and DELETE operations even when bucket listing is denied
 - **Concurrent Processing**: Multi-threaded scanning for efficiency
 - **Detailed Logging**: Verbose output and progress tracking
 - Tests bucket accessibility via HTTP and HTTPS
 - Checks AWS CLI access across all AWS regions
-- Tests PUT and DELETE permissions via both AWS CLI and HTTP/S
+- Tests PUT, GET, and DELETE permissions via both AWS CLI and HTTP/S regardless of listing permissions
 - Tests over 70 bucket name variations and patterns (when `-n` flag is used)
 - Checks multiple URL formats for each bucket variation:
   - Direct bucket access (bucket.com)
@@ -26,7 +26,7 @@ A comprehensive S3 bucket accessibility checker that tests for publicly accessib
   - Website endpoints (bucket.s3-website.region.amazonaws.com)
   - Dualstack endpoints (bucket.s3.dualstack.region.amazonaws.com)
 - Extended S3 feature support including requester pays settings
-- Flexible testing options: test only PUT, test both PUT and DELETE, or skip all write tests entirely
+- Flexible testing options: test PUT and GET only, test PUT/GET/DELETE, or skip all write tests entirely
 - Color-coded output (red for HTTP, green for HTTPS)
 - Threaded concurrent processing for faster results
 - Progress counter for visibility
@@ -150,25 +150,25 @@ Mode: Both Web and CLI checks (exact names only (1 total))
 Regions to check: 30
 
 Choose testing options:
-  p - Test ONLY PUT operations (skip DELETE)
-  b - Test both PUT and DELETE operations
-  s - Skip all write tests (no PUT or DELETE)
+  p - Test PUT and GET operations (skip DELETE)
+  b - Test PUT, GET, and DELETE operations
+  s - Skip all write tests (no PUT, GET, or DELETE)
 Your choice [b/p/s]: b
-Will perform both PUT and DELETE checks.
+Will perform PUT, GET, and DELETE checks.
 
 Enter the message to put in your test file (cannot be empty):
 > This is a security test. Contact security@example.com if found.
 Using test message: 'This is a security test. Contact security@example.com if found.'
 
 Checking CLI access for 1 base bucket(s) across 30 regions...
-[AWS CLI] Found: s3://acme-corp.com No Region (objects: 1342) (PUT, DELETE)
-[AWS CLI] Found: s3://acme-corp.com us-east-1 (objects: 1342) (PUT)
-[AWS CLI] Found: s3://acme-corp.com us-east-2 (objects: 1342)
+[AWS CLI] Found: s3://acme-corp.com No Region (objects: 1342) (PUT, GET, DELETE)
+[AWS CLI] Found: s3://acme-corp.com us-east-1 (objects: 1342) (PUT, GET)
+[AWS CLI] Access Denied (but operations work): s3://acme-corp.com us-east-2 (PUT, GET)
 
 Checking web endpoints for bucket 'acme-corp.com'...
-[Web] Accessible: http://acme-corp.com.s3.amazonaws.com (PUT, DELETE)
-[Web] Accessible: https://acme-corp.com.s3.amazonaws.com (DELETE)
-[Web] Accessible: http://acme-corp.com.s3.us-west-2.amazonaws.com
+[Web] Accessible: http://acme-corp.com.s3.amazonaws.com (PUT, GET, DELETE)
+[Web] Access Denied (but operations work): https://acme-corp.com.s3.amazonaws.com (GET, DELETE)
+[Web] Found (Access Denied): http://acme-corp.com.s3.us-west-2.amazonaws.com
 
 Base bucket 'acme-corp.com' is accessible!
 ```
@@ -186,11 +186,11 @@ Mode: Both Web and CLI checks (exact names only (3 total))
 Regions to check: 30
 
 Choose testing options:
-  p - Test ONLY PUT operations (skip DELETE)
-  b - Test both PUT and DELETE operations
-  s - Skip all write tests (no PUT or DELETE)
+  p - Test PUT and GET operations (skip DELETE)
+  b - Test PUT, GET, and DELETE operations
+  s - Skip all write tests (no PUT, GET, or DELETE)
 Your choice [b/p/s]: s
-Will skip all write tests (no PUT or DELETE).
+Will skip all write tests (no PUT, GET, or DELETE).
 
 Checking CLI access for 3 base bucket(s) across 30 regions...
 [AWS CLI] Found: s3://company-prod us-east-1 (objects: 5432)
@@ -223,11 +223,11 @@ Mode: Both Web and CLI checks (with name variations (67 total))
 Regions to check: 30
 
 Choose testing options:
-  p - Test ONLY PUT operations (skip DELETE)
-  b - Test both PUT and DELETE operations
-  s - Skip all write tests (no PUT or DELETE)
+  p - Test PUT and GET operations (skip DELETE)
+  b - Test PUT, GET, and DELETE operations
+  s - Skip all write tests (no PUT, GET, or DELETE)
 Your choice [b/p/s]: p
-Will perform PUT checks only (no DELETE).
+Will perform PUT and GET checks only (no DELETE).
 
 Enter the message to put in your test file (cannot be empty):
 > Security test file - contact admin@company.com
@@ -235,10 +235,10 @@ Using test message: 'Security test file - contact admin@company.com'
 
 Checking CLI access for 67 bucket variation(s) across 30 regions...
 [AWS CLI] Found: s3://mybucket us-west-2 (objects: 0)
-[AWS CLI] Found: s3://mybucket-dev us-east-1 (objects: 1247) (PUT)
+[AWS CLI] Found: s3://mybucket-dev us-east-1 (objects: 1247) (PUT, GET)
 
 Checking web endpoints for 67 bucket variation(s)...
-[Web] Accessible: https://mybucket.s3.us-west-2.amazonaws.com (PUT)
+[Web] Accessible: https://mybucket.s3.us-west-2.amazonaws.com (PUT, GET)
 [Web] Found (Access Denied): https://www.mybucket.s3.amazonaws.com
 [Web] Accessible: https://mybucket-logs.s3.amazonaws.com
 
@@ -256,16 +256,20 @@ Found 2 additional accessible bucket variation(s).
 7. If CLI checks enabled:
    - Check bucket accessibility via AWS CLI across all regions for each bucket
    - Track number of objects in each accessible bucket
-   - If write tests enabled, test PUT operations with AWS CLI (--no-sign-request) using custom message
+   - Test PUT, GET, and DELETE operations with AWS CLI (--no-sign-request) regardless of listing permissions
+   - If write tests enabled, test PUT operations using custom message
+   - Test GET operations to verify uploaded files can be retrieved
    - If DELETE testing enabled, test DELETE operations only after successful PUT
-   - Report which write operations succeed for each accessible bucket
+   - Report which operations (PUT/GET/DELETE) succeed for each bucket
 8. If Web checks enabled:
    - Generate all endpoint URLs for each bucket variation
    - Check HTTP/HTTPS accessibility of each URL concurrently
    - Detect S3 bucket listings via `<ListBucketResult xmlns=` pattern
-   - If write tests enabled, test PUT operations via HTTP/S for accessible buckets
+   - Test PUT, GET, and DELETE operations via HTTP/S regardless of listing permissions
+   - If write tests enabled, test PUT operations using custom message
+   - Test GET operations to verify uploaded files can be retrieved
    - If DELETE testing enabled, test DELETE operations only after successful PUT
-   - Report accessible buckets with color-coded URLs and write permissions
+   - Report accessible buckets with color-coded URLs and operation permissions
 9. Display comprehensive summary of results including:
    - Base buckets found vs variations found
    - Regional distribution of accessible buckets
