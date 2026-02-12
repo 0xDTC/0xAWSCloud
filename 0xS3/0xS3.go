@@ -455,27 +455,30 @@ func webCheck(url string) {
 
 	status, body := httpFetch(url)
 
-	bucketAccessible := false
+	bucketExists := false
+	canList := false
 	label := ""
 	if status == 403 &&
 		strings.Contains(body, "AccessDenied") &&
 		!strings.Contains(body, "NoSuchBucket") &&
 		!strings.Contains(body, "InvalidBucketName") {
-		bucketAccessible = true
+		bucketExists = true
 		label = "Found (Access Denied)"
 	} else if status == 200 &&
 		strings.Contains(body, "<ListBucketResult xmlns=") &&
 		!strings.Contains(body, "NoSuchBucket") &&
 		!strings.Contains(body, "InvalidBucketName") {
-		bucketAccessible = true
+		bucketExists = true
+		canList = true
 		label = "Accessible"
 	}
 
-	// ── PUT / GET / DELETE via HTTP (skip if bucket doesn't exist) ──
+	// ── PUT / GET / DELETE via HTTP (skip if bucket doesn't exist or website endpoint) ──
 	putOk, getOk, delOk := false, false, false
 	isNoSuchBucket := strings.Contains(body, "NoSuchBucket")
+	isWebsiteEndpoint := strings.Contains(url, "s3-website")
 
-	if !isNoSuchBucket {
+	if !isNoSuchBucket && !isWebsiteEndpoint {
 		objectURL := strings.TrimRight(url, "/") + "/" + testFilename
 
 		if testPut {
@@ -518,7 +521,7 @@ func webCheck(url string) {
 	}
 
 	// ── report ──
-	if bucketAccessible || putOk || getOk || delOk {
+	if bucketExists || putOk || getOk || delOk {
 		matchedBucket := ""
 		for _, v := range allVariations {
 			if strings.Contains(url, v) {
@@ -532,7 +535,7 @@ func webCheck(url string) {
 		markFound(matchedBucket, "")
 		recordAccess(BucketAccess{
 			Bucket: matchedBucket, Region: "", Mode: "web", URL: url,
-			CanList: bucketAccessible, CanPut: putOk, CanGet: getOk, CanDel: delOk,
+			CanList: canList, CanPut: putOk, CanGet: getOk, CanDel: delOk,
 		})
 
 		color := "\033[0m"
@@ -555,7 +558,7 @@ func webCheck(url string) {
 		flags := buildFlags(fp)
 
 		finalLabel := label
-		if !bucketAccessible {
+		if !bucketExists {
 			finalLabel = "Access Denied (but operations work)"
 		}
 
@@ -1534,33 +1537,59 @@ Flags:
 	}
 
 	// ── summary ──
-	var foundBase []string
+	// Determine which buckets have real capabilities vs just "exists (access denied)"
+	usableBuckets := make(map[string]bool) // buckets with at least one working operation
+	for _, a := range accessList {
+		if a.CanList || a.CanPut || a.CanGet || a.CanDel {
+			usableBuckets[a.Bucket] = true
+		}
+	}
+
+	var accessibleBase, deniedBase []string
 	for _, bkt := range baseBuckets {
 		if _, ok := foundBuckets[bkt]; ok {
-			foundBase = append(foundBase, bkt)
+			if usableBuckets[bkt] {
+				accessibleBase = append(accessibleBase, bkt)
+			} else {
+				deniedBase = append(deniedBase, bkt)
+			}
 		}
 	}
 
-	if len(foundBase) > 0 {
+	fmt.Println()
+	if len(accessibleBase) > 0 {
 		if len(baseBuckets) == 1 {
-			fmt.Printf("\nBase bucket '%s' is accessible!\n", baseName)
+			fmt.Printf("Base bucket '\033[1;32m%s\033[0m' is accessible!\n", baseName)
 		} else {
-			fmt.Printf("\nFound %d accessible base bucket(s): %s\n", len(foundBase), strings.Join(foundBase, ", "))
+			fmt.Printf("Found %d accessible base bucket(s): \033[1;32m%s\033[0m\n", len(accessibleBase), strings.Join(accessibleBase, ", "))
+		}
+	}
+	if len(deniedBase) > 0 {
+		if len(baseBuckets) == 1 && len(accessibleBase) == 0 {
+			fmt.Printf("Base bucket '\033[1;33m%s\033[0m' exists but access is denied (no operations succeeded).\n", baseName)
+		} else {
+			fmt.Printf("Found %d bucket(s) that exist but are access denied: \033[1;33m%s\033[0m\n", len(deniedBase), strings.Join(deniedBase, ", "))
 		}
 	}
 
-	if len(foundBuckets) > len(foundBase) {
-		additional := len(foundBuckets) - len(foundBase)
-		fmt.Printf("Found %d additional accessible bucket variation(s).\n", additional)
+	// Count additional variations beyond base buckets
+	allFoundBase := len(accessibleBase) + len(deniedBase)
+	if len(foundBuckets) > allFoundBase {
+		additional := len(foundBuckets) - allFoundBase
+		fmt.Printf("Found %d additional bucket variation(s).\n", additional)
 	}
 
 	if len(foundBuckets) == 0 {
-		fmt.Println("No accessible buckets found.")
+		fmt.Println("No buckets found.")
 	}
 
 	if len(foundBuckets) > 0 && flagVerbose {
-		fmt.Println("\nAll accessible buckets found:")
+		fmt.Println("\nAll found buckets:")
 		for bkt, regs := range foundBuckets {
+			status := "\033[1;33m(access denied)\033[0m"
+			if usableBuckets[bkt] {
+				status = "\033[1;32m(accessible)\033[0m"
+			}
 			regionText := ""
 			if len(regs) > 0 {
 				sorted := make([]string, 0, len(regs))
@@ -1570,7 +1599,7 @@ Flags:
 				sort.Strings(sorted)
 				regionText = fmt.Sprintf(" (regions: %s)", strings.Join(sorted, ", "))
 			}
-			fmt.Printf("  - %s%s\n", bkt, regionText)
+			fmt.Printf("  - %s %s%s\n", bkt, status, regionText)
 		}
 	}
 

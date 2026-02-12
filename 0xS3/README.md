@@ -13,7 +13,9 @@ A comprehensive S3 bucket accessibility scanner written in Go. Tests for publicl
 - **Multi-Region Scanning**: Checks buckets across 30 AWS regions
 - **Dual Testing**: Both AWS CLI (`--no-sign-request`) and web-based endpoint testing
 - **Write Operations**: Test PUT, GET, and DELETE operations even when bucket listing is denied
+- **Smart Summary**: Distinguishes "accessible" (operations work) from "exists but access denied" (bucket found but no operations succeed)
 - **NoSuchBucket Skip**: Automatically skips write tests on non-existent buckets to save time
+- **Website Endpoint Skip**: Skips write tests on `s3-website` endpoints (they only support GET/HEAD, preventing false positives)
 - **Concurrent Processing**: Multi-threaded web scanning with configurable thread count
 - **Interactive Shell**: Post-scan REPL for browsing, downloading, uploading, and deleting objects
 - **Detailed Logging**: Verbose output and progress tracking
@@ -194,7 +196,7 @@ When using the `-l` flag for bulk bucket checking, you **must** specify either `
 ./0xS3 -b acme-corp.com
 ```
 
-Example Output:
+Example Output (bucket with working operations):
 ```
 ==== S3 Bucket Accessibility Check ====
 Base name: acme-corp.com
@@ -228,6 +230,20 @@ Type 'help' for available commands, 'exit' or Ctrl+C to quit.
 0xS3:acme-corp.com>
 ```
 
+Example Output (bucket exists but fully denied):
+```
+Checking CLI access for 1 base bucket(s) across 30 regions...
+[AWS CLI] Not accessible: s3://locked-bucket No Region (AccessDenied)
+[AWS CLI] Not accessible: s3://locked-bucket us-east-1 (AccessDenied)
+...
+
+Checking web endpoints for bucket 'locked-bucket'...
+[Web] Found (Access Denied): https://locked-bucket.s3.amazonaws.com
+[Web] Found (Access Denied): https://locked-bucket.s3.us-east-1.amazonaws.com
+
+Base bucket 'locked-bucket' exists but access is denied (no operations succeeded).
+```
+
 ### Multiple Buckets Mode
 ```bash
 ./0xS3 -l buckets.txt -w
@@ -238,17 +254,39 @@ Type 'help' for available commands, 'exit' or Ctrl+C to quit.
 ./0xS3 -b mybucket -n
 ```
 
-## How NoSuchBucket Optimization Works
+## How Write Testing Works
 
-During scanning, when a bucket returns `NoSuchBucket`, 0xS3 skips the PUT/GET/DELETE write tests for that endpoint. This is safe because:
+When scanning, 0xS3 tests PUT, GET, and DELETE operations regardless of whether listing succeeds. This catches misconfigured buckets where listing is denied but write operations are open.
+
+### Test Flow
+
+1. **LIST** — `aws s3 ls` (CLI) or HTTP GET for XML listing (web)
+2. **PUT** — Upload a test file with your custom message (runs even if LIST was denied)
+3. **GET** — Read back the same test file that was just uploaded (only if PUT succeeded)
+4. **DELETE** — Remove the test file (only if PUT succeeded and DELETE testing is enabled)
+
+GET depends on PUT because it reads back the file you just uploaded — if PUT failed, there's nothing to GET.
+
+### When Write Tests Are Skipped
 
 | Response | Meaning | Write Tests |
 |----------|---------|-------------|
-| **NoSuchBucket** | Bucket does not exist at all | Skipped |
-| **AccessDenied (403)** | Bucket exists but you're not authorized | Tested (may have misconfigured write perms) |
-| **200 + ListBucketResult** | Bucket exists and is publicly listable | Tested |
+| **NoSuchBucket** | Bucket does not exist at all | Skipped — nothing to write to |
+| **s3-website endpoint** | Static website hosting URL | Skipped — only supports GET/HEAD, would produce false positives |
+| **AccessDenied (403)** | Bucket exists but listing is denied | **Tested** — PUT/DELETE may still work due to misconfigured permissions |
+| **200 + ListBucketResult** | Bucket exists and is publicly listable | **Tested** |
 
-This saves up to 3 subprocess calls (CLI) or 3 HTTP requests (web) per non-existent bucket/region combination.
+### Summary Reporting
+
+The final summary distinguishes between buckets that are actually usable and those that just exist:
+
+- **Accessible** — At least one operation works (LIST, PUT, GET, or DELETE)
+- **Exists but access denied** — Bucket was detected (403 AccessDenied) but no operations succeeded
+
+```
+Base bucket 'mybucket' is accessible!                                    # something works
+Base bucket 'mybucket' exists but access is denied (no operations succeeded).  # nothing works
+```
 
 ## Bucket Name Variations
 
@@ -325,16 +363,18 @@ graph TD
 
     G --> G1[Generate All URLs]
     G1 --> G2[Concurrent Web Checks]
-    G2 --> G3{NoSuchBucket?}
+    G2 --> G3{NoSuchBucket or s3-website?}
     G3 -->|Yes| G4[Skip Write Tests]
     G3 -->|No| G5[PUT / GET / DELETE Tests]
     G4 & G5 --> G6[Record Results]
 
     F6 --> Z[Summary]
     G6 --> Z
-    Z --> Z1{Buckets Found?}
-    Z1 -->|Yes| S[Interactive Shell]
-    Z1 -->|No| END[Exit]
+    Z --> Z1{Any Operations Work?}
+    Z1 -->|Yes| Z2[Accessible]
+    Z1 -->|No, but exists| Z3[Exists - Access Denied]
+    Z1 -->|Not found| END[Exit]
+    Z2 & Z3 --> S[Interactive Shell]
     S --> END
 
     subgraph "Interactive Shell"
