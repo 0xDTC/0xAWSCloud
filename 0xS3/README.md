@@ -18,6 +18,7 @@ A comprehensive S3 bucket accessibility scanner written in Go. Tests for publicl
 - **Website Endpoint Skip**: Skips write tests on `s3-website` endpoints (they only support GET/HEAD, preventing false positives)
 - **Concurrent Processing**: Multi-threaded web scanning with configurable thread count
 - **Interactive Shell**: Post-scan REPL for browsing, downloading, uploading, and deleting objects
+- **Search & In-Place Edit**: `find`/`grep` across object keys and contents; `edit`/`replace` rewrite objects in place (read-modify-write) without manually downloading files
 - **Detailed Logging**: Verbose output and progress tracking
 - **Color-coded Output**: Red for HTTP, green for HTTPS
 - Multiple URL formats per bucket variation:
@@ -107,12 +108,22 @@ After scanning, if any accessible buckets are found, 0xS3 drops into an interact
 | `upload <local> <key>` | `ul`, `put` | Upload local file to bucket |
 | `rm <key>` | `del`, `delete` | Delete an object |
 | `head <key>` | `info` | Show object metadata |
+| `find <substr> [prefix]` | | Search object **keys** recursively (case-insensitive substring) |
+| `grep <regexp> [prefix]` | | Search **inside** object contents recursively (case-insensitive regexp) |
+| `edit <key>` | | Read object into `$EDITOR`, overwrite the object on save |
+| `replace <key> <old> <new>` | `sed` | Substitute text in an object and overwrite it |
 | `help` | `?` | Show commands |
 | `exit` | `quit`, Ctrl+C | Exit shell |
 
 Keys are relative to the current prefix. Use `/key` for absolute paths.
 
 Each command automatically uses the correct backend (AWS CLI or HTTP) based on how the bucket was originally discovered.
+
+### Searching and Editing
+
+`find` and `grep` list objects recursively under the current prefix (or an explicit `[prefix]` argument) and search keys or contents respectively. `grep` fetches each object, so it skips binary files and anything larger than 10 MB, and its speed scales with bucket size — scope it with a prefix on large buckets.
+
+`edit` and `replace` modify objects **in place**. Because S3 objects are immutable (there is no partial-update API), both perform a read-modify-write: the whole object is fetched, changed in memory, and re-uploaded to **overwrite** the original. `edit` opens the object in `$EDITOR` (falling back to `$VISUAL`, then `vi`) and uploads only if you change it; `replace` does a non-interactive substitution of all occurrences. Both require the bucket to allow anonymous writes (the same `PUT` capability the scanner reports). Note `<old>`/`<new>` for `replace` are single whitespace-free tokens, as the shell splits commands on spaces.
 
 ### Shell Example
 ```
