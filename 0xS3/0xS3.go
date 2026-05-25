@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"encoding/xml"
 	"flag"
@@ -44,6 +45,8 @@ var awsRegions = []string{
 var (
 	totalRe    = regexp.MustCompile(`Total\s+Objects:\s+(\d+)`)
 	errInParen = regexp.MustCompile(`\(([^)]+)\)`)
+	// lsLineRe parses a line of `aws s3 ls --recursive` output: date time size key.
+	lsLineRe = regexp.MustCompile(`^\S+\s+\S+\s+(\d+)\s+(.*)$`)
 )
 
 // ────────────────────────── bucket access record
@@ -62,13 +65,14 @@ type BucketAccess struct {
 // ────────────────────────── XML types for S3 listing (web mode ls)
 
 type ListBucketResult struct {
-	XMLName        xml.Name         `xml:"ListBucketResult"`
-	Name           string           `xml:"Name"`
-	Prefix         string           `xml:"Prefix"`
-	IsTruncated    bool             `xml:"IsTruncated"`
-	NextMarker     string           `xml:"NextMarker"`
-	Contents       []S3Object       `xml:"Contents"`
-	CommonPrefixes []S3CommonPrefix `xml:"CommonPrefixes"`
+	XMLName               xml.Name         `xml:"ListBucketResult"`
+	Name                  string           `xml:"Name"`
+	Prefix                string           `xml:"Prefix"`
+	IsTruncated           bool             `xml:"IsTruncated"`
+	NextMarker            string           `xml:"NextMarker"`
+	NextContinuationToken string           `xml:"NextContinuationToken"`
+	Contents              []S3Object       `xml:"Contents"`
+	CommonPrefixes        []S3CommonPrefix `xml:"CommonPrefixes"`
 }
 
 type S3Object struct {
@@ -435,12 +439,16 @@ func runCLIChecks() {
 // ────────────────────────── web probe
 
 func httpFetch(url string) (int, string) {
-	resp, err := httpClient.Get(url)
+	return httpFetchLimit(url, 1<<20)
+}
+
+func httpFetchLimit(u string, max int64) (int, string) {
+	resp, err := httpClient.Get(u)
 	if err != nil {
 		return 0, err.Error()
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, max))
 	return resp.StatusCode, string(body)
 }
 
@@ -743,6 +751,10 @@ Available commands:
   upload <local> <key>     Upload local file to bucket    (aliases: ul, put)
   rm <key>                 Delete an object               (aliases: del, delete)
   head <key>               Show object metadata            (alias: info)
+  find <substr> [prefix]   Search object keys (recursive, case-insensitive)
+  grep <regexp> [prefix]   Search inside object contents (recursive)
+  edit <key>               Edit object in $EDITOR, overwrite on save
+  replace <key> <o> <n>    Substitute text in an object   (alias: sed)
   help                     Show this help
   exit                     Exit the shell (also: Ctrl+C)
 
@@ -1291,6 +1303,367 @@ func shellHeadWeb(state *ShellState, key string) {
 	}
 }
 
+// ────────────────────────── shared object helpers (mode-dispatched)
+
+// listAllKeys returns every object key under prefix (recursive, no delimiter),
+// using whichever backend the active bucket was discovered through.
+func listAllKeys(a *BucketAccess, prefix string) ([]S3Object, error) {
+	if a.Mode == "cli" {
+		return listAllKeysCLI(a, prefix)
+	}
+	return listAllKeysWeb(a, prefix)
+}
+
+func listAllKeysCLI(a *BucketAccess, prefix string) ([]S3Object, error) {
+	s3Path := "s3://" + a.Bucket + "/"
+	if prefix != "" {
+		s3Path += prefix
+	}
+	args := []string{"s3", "ls", s3Path, "--recursive", "--no-sign-request"}
+	if a.Region != "" {
+		args = append(args, "--region", a.Region)
+	}
+	out, err := exec.Command("aws", args...).CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("%v\n%s", err, string(out))
+	}
+	var objs []S3Object
+	sc := bufio.NewScanner(bytes.NewReader(out))
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		if m := lsLineRe.FindStringSubmatch(sc.Text()); m != nil {
+			size, _ := strconv.ParseInt(m[1], 10, 64)
+			objs = append(objs, S3Object{Key: m[2], Size: size})
+		}
+	}
+	return objs, nil
+}
+
+func listAllKeysWeb(a *BucketAccess, prefix string) ([]S3Object, error) {
+	baseURL := strings.TrimRight(a.URL, "/")
+	var objs []S3Object
+	token := ""
+	useV1 := false
+	for {
+		var q string
+		if useV1 {
+			q = "?"
+			if prefix != "" {
+				q += "prefix=" + url.QueryEscape(prefix) + "&"
+			}
+			if token != "" {
+				q += "marker=" + url.QueryEscape(token) + "&"
+			}
+		} else {
+			q = "?list-type=2"
+			if prefix != "" {
+				q += "&prefix=" + url.QueryEscape(prefix)
+			}
+			if token != "" {
+				q += "&continuation-token=" + url.QueryEscape(token)
+			}
+		}
+
+		status, body := httpFetchLimit(baseURL+"/"+q, 16<<20)
+		if status != 200 {
+			if !useV1 { // retry once with the older list API
+				useV1 = true
+				token = ""
+				continue
+			}
+			return objs, fmt.Errorf("HTTP %d", status)
+		}
+
+		var result ListBucketResult
+		if err := xml.Unmarshal([]byte(body), &result); err != nil {
+			return objs, fmt.Errorf("parse listing: %v", err)
+		}
+		objs = append(objs, result.Contents...)
+
+		if !result.IsTruncated {
+			break
+		}
+		if useV1 {
+			token = result.NextMarker
+			if token == "" && len(result.Contents) > 0 {
+				token = result.Contents[len(result.Contents)-1].Key
+			}
+		} else {
+			token = result.NextContinuationToken
+		}
+		if token == "" {
+			break
+		}
+	}
+	return objs, nil
+}
+
+// fetchObject returns an object's bytes (up to limit bytes; limit <= 0 = unlimited).
+func fetchObject(a *BucketAccess, key string, limit int64) ([]byte, error) {
+	if a.Mode == "cli" {
+		return fetchObjectCLI(a, key, limit)
+	}
+	return fetchObjectWeb(a, key, limit)
+}
+
+func fetchObjectCLI(a *BucketAccess, key string, limit int64) ([]byte, error) {
+	args := []string{"s3", "cp", "s3://" + a.Bucket + "/" + key, "-", "--no-sign-request"}
+	if a.Region != "" {
+		args = append(args, "--region", a.Region)
+	}
+	cmd := exec.Command("aws", args...)
+	var errBuf bytes.Buffer
+	cmd.Stderr = &errBuf
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("%v: %s", err, strings.TrimSpace(errBuf.String()))
+	}
+	if limit > 0 && int64(len(out)) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func fetchObjectWeb(a *BucketAccess, key string, limit int64) ([]byte, error) {
+	objURL := strings.TrimRight(a.URL, "/") + "/" + s3KeyToURLPath(key)
+	resp, err := httpClient.Get(objURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var r io.Reader = resp.Body
+	if limit > 0 {
+		r = io.LimitReader(resp.Body, limit)
+	}
+	body, _ := io.ReadAll(r)
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return body, nil
+}
+
+// uploadObject overwrites key with data via the active backend. S3 has no partial
+// update, so callers fetch the whole object, modify it, then overwrite it here.
+func uploadObject(a *BucketAccess, key string, data []byte) error {
+	if a.Mode == "cli" {
+		return uploadObjectCLI(a, key, data)
+	}
+	return uploadObjectWeb(a, key, data)
+}
+
+func uploadObjectCLI(a *BucketAccess, key string, data []byte) error {
+	args := []string{"s3", "cp", "-", "s3://" + a.Bucket + "/" + key, "--no-sign-request"}
+	if a.Region != "" {
+		args = append(args, "--region", a.Region)
+	}
+	cmd := exec.Command("aws", args...)
+	cmd.Stdin = bytes.NewReader(data)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%v\n%s", err, string(out))
+	}
+	return nil
+}
+
+func uploadObjectWeb(a *BucketAccess, key string, data []byte) error {
+	objURL := strings.TrimRight(a.URL, "/") + "/" + s3KeyToURLPath(key)
+	req, err := http.NewRequest("PUT", objURL, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.ContentLength = int64(len(data))
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode == 200 || resp.StatusCode == 201 || resp.StatusCode == 204 {
+		return nil
+	}
+	return fmt.Errorf("HTTP %d", resp.StatusCode)
+}
+
+// ────────────────────────── find / grep (search)
+
+const maxGrepObjectSize = 10 << 20 // skip objects larger than this when grepping
+
+// resolveSearchPrefix picks the prefix to search under: an explicit second arg,
+// otherwise the current working prefix.
+func resolveSearchPrefix(state *ShellState, args []string) string {
+	prefix := state.cwdPrefix
+	if len(args) > 1 {
+		prefix = resolveKey(state, args[1])
+		if prefix != "" && !strings.HasSuffix(prefix, "/") {
+			prefix += "/"
+		}
+	}
+	return prefix
+}
+
+func shellFind(state *ShellState, args []string) {
+	if !requireActive(state) {
+		return
+	}
+	if len(args) == 0 {
+		fmt.Println("Usage: find <substring> [prefix]   (case-insensitive match on object keys)")
+		return
+	}
+	keys, err := listAllKeys(state.activeAccess, resolveSearchPrefix(state, args))
+	if err != nil {
+		fmt.Printf("Error listing objects: %v\n", err)
+		return
+	}
+	needle := strings.ToLower(args[0])
+	count := 0
+	for _, o := range keys {
+		if strings.Contains(strings.ToLower(o.Key), needle) {
+			fmt.Printf("  %10d  %s\n", o.Size, o.Key)
+			count++
+		}
+	}
+	fmt.Printf("%d match(es) out of %d object(s).\n", count, len(keys))
+}
+
+func shellGrep(state *ShellState, args []string) {
+	if !requireActive(state) {
+		return
+	}
+	if len(args) == 0 {
+		fmt.Println("Usage: grep <regexp> [prefix]   (case-insensitive search inside object contents)")
+		return
+	}
+	re, err := regexp.Compile("(?i)" + args[0])
+	if err != nil {
+		fmt.Printf("Invalid pattern: %v\n", err)
+		return
+	}
+	keys, err := listAllKeys(state.activeAccess, resolveSearchPrefix(state, args))
+	if err != nil {
+		fmt.Printf("Error listing objects: %v\n", err)
+		return
+	}
+
+	a := state.activeAccess
+	matches, scanned, skipped := 0, 0, 0
+	for i, o := range keys {
+		fmt.Fprintf(os.Stdout, "\r%-80s\r[%d/%d] grep...", "", i+1, len(keys))
+		if o.Size > maxGrepObjectSize {
+			skipped++
+			continue
+		}
+		data, err := fetchObject(a, o.Key, maxGrepObjectSize)
+		if err != nil {
+			continue
+		}
+		if bytes.IndexByte(data, 0) >= 0 { // skip binary blobs
+			skipped++
+			continue
+		}
+		scanned++
+		sc := bufio.NewScanner(bytes.NewReader(data))
+		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		ln := 0
+		for sc.Scan() {
+			ln++
+			if re.MatchString(sc.Text()) {
+				fmt.Fprintf(os.Stdout, "\r%-80s\r", "")
+				fmt.Printf("%s:%d: %s\n", o.Key, ln, strings.TrimSpace(sc.Text()))
+				matches++
+			}
+		}
+	}
+	fmt.Fprintf(os.Stdout, "\r%-80s\r", "")
+	fmt.Printf("%d match(es); scanned %d object(s), skipped %d (binary/oversized).\n", matches, scanned, skipped)
+}
+
+// ────────────────────────── edit / replace (read-modify-write)
+
+func shellEdit(state *ShellState, args []string) {
+	if !requireActive(state) {
+		return
+	}
+	if len(args) == 0 {
+		fmt.Println("Usage: edit <key>   (opens $EDITOR, then overwrites the object on save)")
+		return
+	}
+	a := state.activeAccess
+	key := resolveKey(state, args[0])
+
+	data, err := fetchObject(a, key, 0)
+	if err != nil {
+		fmt.Printf("Error fetching %s: %v\n", key, err)
+		return
+	}
+
+	tmpFile := filepath.Join(tmpDir, "edit_"+filepath.Base(key))
+	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+		fmt.Printf("Error writing temp file: %v\n", err)
+		return
+	}
+	defer os.Remove(tmpFile)
+
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = os.Getenv("VISUAL")
+	}
+	if editor == "" {
+		editor = "vi"
+	}
+	edParts := strings.Fields(editor)
+	cmd := exec.Command(edParts[0], append(edParts[1:], tmpFile)...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Printf("Editor exited with error: %v\n", err)
+		return
+	}
+
+	newData, err := os.ReadFile(tmpFile)
+	if err != nil {
+		fmt.Printf("Error reading edited file: %v\n", err)
+		return
+	}
+	if bytes.Equal(newData, data) {
+		fmt.Println("No changes; nothing uploaded.")
+		return
+	}
+	if err := uploadObject(a, key, newData); err != nil {
+		fmt.Printf("Upload failed: %v\n", err)
+		return
+	}
+	fmt.Printf("Saved %d bytes to s3://%s/%s (overwrote previous object).\n", len(newData), a.Bucket, key)
+}
+
+func shellReplace(state *ShellState, args []string) {
+	if !requireActive(state) {
+		return
+	}
+	if len(args) < 3 {
+		fmt.Println("Usage: replace <key> <old> <new>   (old/new are single whitespace-free tokens)")
+		return
+	}
+	a := state.activeAccess
+	key := resolveKey(state, args[0])
+	oldTok, newTok := args[1], args[2]
+
+	data, err := fetchObject(a, key, 0)
+	if err != nil {
+		fmt.Printf("Error fetching %s: %v\n", key, err)
+		return
+	}
+	n := bytes.Count(data, []byte(oldTok))
+	if n == 0 {
+		fmt.Printf("'%s' not found in %s; nothing changed.\n", oldTok, key)
+		return
+	}
+	newData := bytes.ReplaceAll(data, []byte(oldTok), []byte(newTok))
+	if err := uploadObject(a, key, newData); err != nil {
+		fmt.Printf("Upload failed: %v\n", err)
+		return
+	}
+	fmt.Printf("Replaced %d occurrence(s) of '%s' in s3://%s/%s.\n", n, oldTok, a.Bucket, key)
+}
+
 // ────────────────────────── shell command dispatch
 
 func handleCommand(state *ShellState, line string) {
@@ -1324,6 +1697,14 @@ func handleCommand(state *ShellState, line string) {
 		shellRm(state, args)
 	case "head", "info":
 		shellHead(state, args)
+	case "find":
+		shellFind(state, args)
+	case "grep":
+		shellGrep(state, args)
+	case "edit":
+		shellEdit(state, args)
+	case "replace", "sed":
+		shellReplace(state, args)
 	default:
 		fmt.Printf("Unknown command: %s. Type 'help' for available commands.\n", cmd)
 	}
