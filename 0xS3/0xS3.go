@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/xml"
 	"flag"
@@ -26,7 +27,16 @@ import (
 
 // ────────────────────────── constants
 
-const testFilename = "Bug-Bounty-From-Production-Exploiter.txt"
+// defaultTestFilename is overridable with -f. The object name should identify
+// the write as authorised testing to whoever finds it, and engagements often
+// mandate their own convention (for example network-test.txt).
+const defaultTestFilename = "Bug-Bounty-From-Production-Exploiter.txt"
+
+var testFilename = defaultTestFilename
+
+var firstKeyRe = regexp.MustCompile(`(?s)<Key>(.*?)</Key>`)
+
+var flagInsecureTLS bool
 
 var awsRegions = []string{
 	"us-east-1", "us-east-2", "us-west-1", "us-west-2",
@@ -241,11 +251,117 @@ func buildVariations() []string {
 
 // ────────────────────────── endpoint generation
 
+// isS3Endpoint reports whether a URL addresses an AWS S3 endpoint rather than
+// some arbitrary host that merely shares the bucket's name. Write probes are
+// restricted to these, because a PUT to an unrelated web server proves nothing
+// about S3 permissions.
+func isS3Endpoint(rawurl string) bool {
+	u, err := url.Parse(rawurl)
+	if err != nil {
+		return false
+	}
+	h := u.Hostname()
+	return h == "amazonaws.com" || strings.HasSuffix(h, ".amazonaws.com")
+}
+
+// ── AWS CLI invocation with a hard timeout and a dead-region circuit breaker ──
+//
+// Some region endpoints resolve in DNS but silently drop packets rather than
+// refusing the connection, so a request hangs for the full timeout instead of
+// failing fast. me-south-1 behaves this way from many networks. With AWS CLI
+// defaults (60s connect + 60s read, legacy retry mode, up to 5 attempts) a
+// single unreachable region can cost 600 seconds per bucket, and exec.Command
+// with no context waits for all of it.
+//
+// Two defences. First, every invocation is bounded by awsCLITimeout and told
+// not to retry. Second, once a region has timed out deadRegionThreshold times
+// it is marked dead and skipped for the remainder of the run, so the cost is
+// paid once rather than once per bucket.
+
+const (
+	awsCLITimeout       = 25 * time.Second
+	deadRegionThreshold = 2
+)
+
+var (
+	deadRegionMu  sync.Mutex
+	deadRegionHit = map[string]int{}
+)
+
+func regionIsDead(region string) bool {
+	if region == "" {
+		return false
+	}
+	deadRegionMu.Lock()
+	defer deadRegionMu.Unlock()
+	return deadRegionHit[region] >= deadRegionThreshold
+}
+
+func markRegionTimeout(region string) int {
+	if region == "" {
+		return 0
+	}
+	deadRegionMu.Lock()
+	defer deadRegionMu.Unlock()
+	deadRegionHit[region]++
+	return deadRegionHit[region]
+}
+
+// runAWS executes the AWS CLI with a bounded lifetime. The bool reports whether
+// the command was killed by the timeout rather than returning an error itself.
+func runAWS(region string, args ...string) ([]byte, error, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), awsCLITimeout)
+	defer cancel()
+
+	// Keep the CLI's own budget inside ours so it gives up first where it can.
+	args = append(args, "--cli-connect-timeout", "8", "--cli-read-timeout", "8")
+
+	cmd := exec.CommandContext(ctx, "aws", args...)
+	cmd.Env = append(os.Environ(), "AWS_MAX_ATTEMPTS=1", "AWS_RETRY_MODE=standard")
+	out, err := cmd.CombinedOutput()
+
+	// Two ways a region can be unreachable: our context fires, or the CLI gives
+	// up inside our budget and reports a connectivity failure. Both mean the
+	// endpoint is not answering, and both should count towards marking the
+	// region dead. Only counting the context deadline let a region that failed
+	// just inside the budget cost its full timeout on every remaining bucket.
+	timedOut := ctx.Err() == context.DeadlineExceeded || isUnreachable(string(out))
+	if timedOut {
+		n := markRegionTimeout(region)
+		if n == deadRegionThreshold {
+			// Always shown, never verbose-gated: dropping a region changes the
+			// coverage of the scan, so the operator has to see it.
+			logMsg(fmt.Sprintf("[AWS CLI] region %s is not reachable from this network. Skipping it for the rest of this run; results will NOT cover %s.", region, region), true)
+		}
+	}
+	return out, err, timedOut
+}
+
+// isUnreachable reports whether AWS CLI output indicates the endpoint could not
+// be reached at all, as opposed to answering with a permission or naming error.
+func isUnreachable(out string) bool {
+	for _, sig := range []string{
+		"Connect timeout on endpoint URL",
+		"Read timeout on endpoint URL",
+		"Could not connect to the endpoint URL",
+		"EndpointConnectionError",
+		"ConnectTimeoutError",
+	} {
+		if strings.Contains(out, sig) {
+			return true
+		}
+	}
+	return false
+}
+
 func buildEndpoints(bucket, region string) []string {
 	var urls []string
 	for _, proto := range []string{"http", "https"} {
-		urls = append(urls, proto+"://"+bucket)
 		if region == "" {
+			// Emitted only for the empty region so the bare hostname is not
+			// regenerated once per region. checkedSet deduplicated these at
+			// probe time, but they still inflated the progress total.
+			urls = append(urls, proto+"://"+bucket)
 			urls = append(urls,
 				fmt.Sprintf("%s://%s.s3.amazonaws.com", proto, bucket),
 				fmt.Sprintf("%s://s3.amazonaws.com/%s", proto, bucket),
@@ -327,6 +443,11 @@ func cliProbe(bucket string) {
 			label = region
 		}
 
+		// A region that has already timed out repeatedly is not probed again.
+		if regionIsDead(region) {
+			continue
+		}
+
 		// ── aws s3 ls ──
 		args := []string{"s3", "ls", "s3://" + bucket, "--no-sign-request", "--summarize"}
 		if region != "" {
@@ -337,7 +458,10 @@ func cliProbe(bucket string) {
 		objectCount := ""
 		errorOutput := ""
 
-		out, err := exec.Command("aws", args...).CombinedOutput()
+		out, err, timedOut := runAWS(region, args...)
+		if timedOut {
+			continue
+		}
 		outStr := string(out)
 		if err == nil {
 			if m := totalRe.FindStringSubmatch(outStr); len(m) > 1 {
@@ -365,17 +489,17 @@ func cliProbe(bucket string) {
 			}
 
 			if testPut {
-				if _, e := exec.Command("aws", putArgs...).CombinedOutput(); e == nil {
+				if _, e, to := runAWS(region, putArgs...); e == nil && !to {
 					putOk = true
 				}
 			}
 			if putOk {
-				if _, e := exec.Command("aws", getArgs...).CombinedOutput(); e == nil {
+				if _, e, to := runAWS(region, getArgs...); e == nil && !to {
 					getOk = true
 				}
 			}
 			if testDelete && putOk {
-				if _, e := exec.Command("aws", rmArgs...).CombinedOutput(); e == nil {
+				if _, e, to := runAWS(region, rmArgs...); e == nil && !to {
 					delOk = true
 				}
 			}
@@ -443,13 +567,100 @@ func httpFetch(url string) (int, string) {
 }
 
 func httpFetchLimit(u string, max int64) (int, string) {
+	code, body, _ := httpFetchMeta(u, max)
+	return code, body
+}
+
+// httpFetchMeta also returns the x-amz-bucket-region header. Every S3 response
+// carries it, including error responses, so the bucket's real region is
+// available even when listing is denied. It was previously discarded, which
+// left web-mode results with an empty Region field.
+func httpFetchMeta(u string, max int64) (int, string, string) {
 	resp, err := httpClient.Get(u)
 	if err != nil {
-		return 0, err.Error()
+		return 0, err.Error(), ""
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, max))
-	return resp.StatusCode, string(body)
+	return resp.StatusCode, string(body), resp.Header.Get("x-amz-bucket-region")
+}
+
+// firstKey returns the first object key from a ListBucketResult body, or "" if
+// the body is not a listing. Used to test anonymous read against a real object
+// rather than against the tool's own upload.
+func firstKey(body string) string {
+	// Scan the whole listing, not just the first entry. A listing often opens
+	// with folder placeholders such as "DAMRoot/", which are zero byte marker
+	// objects rather than real content. Returning on the first match meant a
+	// readable bucket reported no GET simply because its first key was a folder.
+	for _, m := range firstKeyRe.FindAllStringSubmatch(body, -1) {
+		if len(m) < 2 {
+			continue
+		}
+		k := strings.TrimSpace(m[1])
+		if k == "" || strings.HasSuffix(k, "/") {
+			continue
+		}
+		return k
+	}
+	return ""
+}
+
+// keyURL joins a bucket URL and an object key, escaping each path segment.
+// Keys legitimately contain spaces and other characters that would otherwise
+// produce a malformed request (for example "about redirects.txt").
+func keyURL(base, key string) string {
+	parts := strings.Split(key, "/")
+	for i, p := range parts {
+		parts[i] = url.PathEscape(p)
+	}
+	return strings.TrimRight(base, "/") + "/" + strings.Join(parts, "/")
+}
+
+func httpHead(u string) (int, string) {
+	req, err := http.NewRequest("HEAD", u, nil)
+	if err != nil {
+		return 0, ""
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return 0, ""
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode, resp.Header.Get("Content-Length")
+}
+
+// anonPut performs an unauthenticated PutObject and confirms the write really
+// happened rather than trusting the status code.
+//
+// Confirmation matters because a 200 alone proves nothing: any web server can
+// return 200 to a PUT it silently discarded. But confirmation cannot rely on
+// reading the object back, because a bucket may grant PutObject while denying
+// GetObject. That is not hypothetical: fontdisco-km in the Monotype estate
+// accepts anonymous PUT and returns 403 to both GET and DELETE, so a
+// read-back check would report it as not writable and miss a real finding.
+//
+// The compromise below: accept the write if S3 returns a success status AND
+// an ETag header. S3 returns the object's ETag on a successful PutObject and
+// an ordinary web server has no reason to. This confirms S3 itself accepted
+// and stored the object, without requiring read access.
+func anonPut(objectURL string) bool {
+	req, err := http.NewRequest("PUT", objectURL, strings.NewReader(testContent))
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Content-Type", "text/plain")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode != 200 && resp.StatusCode != 201 && resp.StatusCode != 204 {
+		return false
+	}
+	return resp.Header.Get("ETag") != ""
 }
 
 func webCheck(url string) {
@@ -461,7 +672,7 @@ func webCheck(url string) {
 	checkedSet[url] = true
 	mu.Unlock()
 
-	status, body := httpFetch(url)
+	status, body, region := httpFetchMeta(url, 1<<20)
 
 	bucketExists := false
 	canList := false
@@ -481,37 +692,41 @@ func webCheck(url string) {
 		label = "Accessible"
 	}
 
-	// ── PUT / GET / DELETE via HTTP (skip if bucket doesn't exist or website endpoint) ──
+	// ── PUT / GET / DELETE ────────────────────────────────────────────────
+	//
+	// Write probes run only against genuine S3 endpoints. The bare hostname
+	// form (https://<bucket>) is frequently a live website that shares the
+	// bucket's name, and a 200 from it says nothing about S3 permissions.
 	putOk, getOk, delOk := false, false, false
 	isNoSuchBucket := strings.Contains(body, "NoSuchBucket")
 	isWebsiteEndpoint := strings.Contains(url, "s3-website")
 
-	if !isNoSuchBucket && !isWebsiteEndpoint {
+	// Anonymous READ. Tested on any URL that returned a genuine S3 listing,
+	// including a plain hostname that is CNAMEd to S3. If we can see a real
+	// object key we fetch it, so an accessible bucket reports GET even when it
+	// is read only. Previously GET was gated behind a successful PUT, so it
+	// meant "read back my own upload" and a public read only bucket showed no
+	// GET at all.
+	if canList {
+		if k := firstKey(body); k != "" {
+			if code, _ := httpHead(keyURL(url, k)); code == 200 {
+				getOk = true
+			}
+		}
+	}
+
+	// Anonymous WRITE. Restricted to real S3 endpoints, because a PUT to an
+	// unrelated web server that happens to share the bucket's name proves
+	// nothing about S3 permissions.
+	if !isNoSuchBucket && !isWebsiteEndpoint && isS3Endpoint(url) {
 		objectURL := strings.TrimRight(url, "/") + "/" + testFilename
 
 		if testPut {
-			req, err := http.NewRequest("PUT", objectURL, strings.NewReader(testContent))
-			if err == nil {
-				req.Header.Set("Content-Type", "text/plain")
-				if resp, err := httpClient.Do(req); err == nil {
-					_, _ = io.Copy(io.Discard, resp.Body)
-					resp.Body.Close()
-					if resp.StatusCode == 200 || resp.StatusCode == 201 || resp.StatusCode == 204 {
-						putOk = true
-					}
-				}
-			}
+			putOk = anonPut(objectURL)
 		}
-		if putOk {
-			req, err := http.NewRequest("GET", objectURL, nil)
-			if err == nil {
-				if resp, err := httpClient.Do(req); err == nil {
-					_, _ = io.Copy(io.Discard, resp.Body)
-					resp.Body.Close()
-					if resp.StatusCode == 200 {
-						getOk = true
-					}
-				}
+		if putOk && !getOk {
+			if code, _ := httpHead(objectURL); code == 200 {
+				getOk = true
 			}
 		}
 		if testDelete && putOk {
@@ -530,11 +745,13 @@ func webCheck(url string) {
 
 	// ── report ──
 	if bucketExists || putOk || getOk || delOk {
+		// Longest match wins. Matching on the first substring hit meant a short
+		// variation that happens to appear inside the URL could beat the longer
+		// name that actually produced it, purely by slice order.
 		matchedBucket := ""
 		for _, v := range allVariations {
-			if strings.Contains(url, v) {
+			if strings.Contains(url, v) && len(v) > len(matchedBucket) {
 				matchedBucket = v
-				break
 			}
 		}
 		if matchedBucket == "" {
@@ -542,7 +759,7 @@ func webCheck(url string) {
 		}
 		markFound(matchedBucket, "")
 		recordAccess(BucketAccess{
-			Bucket: matchedBucket, Region: "", Mode: "web", URL: url,
+			Bucket: matchedBucket, Region: region, Mode: "web", URL: url,
 			CanList: canList, CanPut: putOk, CanGet: getOk, CanDel: delOk,
 		})
 
@@ -565,9 +782,12 @@ func webCheck(url string) {
 		}
 		flags := buildFlags(fp)
 
+		// bucketExists == false means neither the 403+AccessDenied nor the
+		// 200+ListBucketResult test matched, so claiming "Access Denied" here
+		// asserted a state the code had just ruled out.
 		finalLabel := label
 		if !bucketExists {
-			finalLabel = "Access Denied (but operations work)"
+			finalLabel = "No bucket listing, but object operations succeeded"
 		}
 
 		mu.Lock()
@@ -1772,6 +1992,10 @@ func main() {
 	flag.BoolVar(&flagNameVar, "name-variations", false, "Search for bucket name variations")
 	flag.BoolVar(&flagVerbose, "v", false, "Show all access attempts (verbose mode)")
 	flag.BoolVar(&flagVerbose, "verbose", false, "Show all access attempts (verbose mode)")
+	flag.StringVar(&testFilename, "f", defaultTestFilename, "Name of the test object written during write checks")
+	flag.StringVar(&testFilename, "test-file", defaultTestFilename, "Name of the test object written during write checks")
+	flag.BoolVar(&flagInsecureTLS, "k", false, "Skip TLS certificate verification (off by default)")
+	flag.BoolVar(&flagInsecureTLS, "insecure", false, "Skip TLS certificate verification")
 	flag.IntVar(&flagThreads, "t", 30, "Concurrent threads for web checks (default: 30)")
 	flag.IntVar(&flagThreads, "threads", 30, "Concurrent threads for web checks")
 
@@ -1851,11 +2075,20 @@ Flags:
 	testFilePath = filepath.Join(tmpDir, testFilename)
 	defer os.RemoveAll(tmpDir)
 
-	// ── HTTP client (skip TLS verification, matching Python behaviour) ──
+	// ── HTTP client (TLS verified by default, -k to skip; redirects never followed) ──
 	httpClient = &http.Client{
 		Timeout: 15 * time.Second,
+		// Never follow redirects. Go rewrites the method to GET on 301/302/303,
+		// so a followed redirect turns a PUT or DELETE into a GET of whatever
+		// the redirect target is. A 200 from that target was previously recorded
+		// as a successful object write, which produced false "writable bucket"
+		// reports against any hostname that redirects (for example a bare domain
+		// redirecting to its www form).
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 		Transport: &http.Transport{
-			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: flagInsecureTLS},
 			MaxIdleConns:        100,
 			MaxIdleConnsPerHost: 10,
 		},
